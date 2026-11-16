@@ -217,7 +217,7 @@ pub fn to_color_image(pm: &Pixmap) -> egui::ColorImage {
 
 pub fn from_rgba_unmul(w: u32, h: u32, rgba: &[u8]) -> Option<Pixmap> {
     let mut pm = Pixmap::new(w, h)?;
-    for (dst, s) in pm.pixels_mut().iter_mut().zip(rgba.chunks_exact(4)) {
+    for (dst, s) in pm.pixels_mut().iter_mut().zip(rgba.as_chunks::<4>().0) {
         let a = s[3] as u16;
         let m = |c: u8| ((c as u16 * a + 127) / 255) as u8;
         *dst = PremultipliedColorU8::from_rgba(m(s[0]), m(s[1]), m(s[2]), s[3]).unwrap();

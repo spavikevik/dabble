@@ -1,8 +1,18 @@
 # Dabble
 
-A simple paint app for macOS in Rust. It follows the layout and behavior of Windows 11 Paint, but it is not a Microsoft product and uses none of Microsoft's assets.
+A simple paint app for macOS, written in Rust. It follows the layout and behavior of Windows 11 Paint.
+
+Dabble is not affiliated with or endorsed by Microsoft, and uses none of Microsoft's names, icons or artwork.
+
+![Dabble with brushes, a textured polygon and the layers panel](docs/screenshots/dabble-layers.png)
+
+| Dark appearance | Resize and Skew |
+| --- | --- |
+| ![Dark appearance](docs/screenshots/dabble-dark.png) | ![Resize and Skew dialog](docs/screenshots/dabble-resize.png) |
 
 ## Run
+
+Needs macOS and Rust 1.88 or newer. Tested on macOS 26.
 
 ```sh
 cargo run --release            # empty canvas
@@ -28,12 +38,24 @@ scripts/bundle.sh              # build target/release/Dabble.app (with icon), th
 - Two interfaces (Settings, ⌘,): the Paint-style ribbon, or a native macOS one with an `NSToolbar` and a Liquid Glass inspector built from real AppKit controls (tool options, color wells, palette, layers). On macOS before 26 the inspector uses the sidebar material instead of Liquid Glass. Settings are saved to `~/Library/Application Support/Dabble/settings.txt`. To try an interface without saving it: `DABBLE_INTERFACE=native` (or `classic`), `DABBLE_THEME=light`/`dark`.
 - Native macOS menu bar with standard shortcuts
 
+There are no prebuilt downloads yet; build from source. The `.app` from `scripts/bundle.sh` is signed only for your own Mac.
+
 ## Tests
 
 ```sh
 cargo test                                                        # unit tests + headless UI interaction tests
 DABBLE_SHOT_DIR=/tmp cargo test render_screenshots -- --ignored     # render the UI offscreen to PNGs
 ```
+
+The screenshots above come from that second command. The native macOS interface can't be captured this way, so it isn't pictured.
+
+## How it was built
+
+Most of the code was written with Claude Code, Anthropic's AI coding tool. I set the scope and direction (feature phases, the name, the native-interface approach) and tested the app. Known gaps are tracked as [issues](https://github.com/spavikevik/dabble/issues).
+
+## License
+
+Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option. Unless you state otherwise, any contribution you submit for inclusion in this project is dual licensed the same way.
 
 ## Dependencies and licenses
 

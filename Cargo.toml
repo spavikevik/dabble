@@ -2,6 +2,11 @@
 name = "dabble"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "A paint app for macOS in Rust, laid out like Windows 11 Paint"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/spavikevik/dabble"
+publish = false
 
 [dependencies]
 ab_glyph = "0.2.32"

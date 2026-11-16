@@ -29,6 +29,35 @@ pub enum Op {
     MoveSelection { grab: Pos2, orig: (i32, i32) },
     TextBox { start: Pos2, end: Pos2 },
     TextMove { grab: Pos2, orig: Rect },
+    /// Dragging a canvas edge handle (index into `handle_points`: 3, 4 or 5).
+    CanvasResize { handle: usize, size: (u32, u32), off: egui::Vec2 },
+    /// Dragging a selection handle: scales the selected pixels.
+    SelectionHandle { handle: usize, min0: Pos2, max0: Pos2 },
+}
+
+/// The canvas edge handles that resize the canvas: right, bottom-right, bottom.
+const CANVAS_HANDLES: [usize; 3] = [3, 4, 5];
+
+/// Move one side or corner of a box to `q`, by handle index.
+fn drag_handle(handle: usize, min0: Pos2, max0: Pos2, q: Pos2) -> (Pos2, Pos2) {
+    let (mut mn, mut mx) = (min0, max0);
+    match handle {
+        0 => mn = q,
+        1 => mn.y = q.y,
+        2 => {
+            mn.y = q.y;
+            mx.x = q.x;
+        }
+        3 => mx.x = q.x,
+        4 => mx = q,
+        5 => mx.y = q.y,
+        6 => {
+            mn.x = q.x;
+            mx.y = q.y;
+        }
+        _ => mn.x = q.x,
+    }
+    (mn, mx)
 }
 
 fn px(p: Pos2) -> (i32, i32) {
@@ -83,8 +112,10 @@ impl DaubApp {
             self.view.pan += scroll;
         }
 
-        self.handle_keys(&ctx);
-        self.handle_pointer(&ctx, &resp);
+        if self.dialog.is_none() {
+            self.handle_keys(&ctx);
+            self.handle_pointer(&ctx, &resp);
+        }
         self.clamp_pan();
 
         // Upload the document when it changed.
@@ -279,6 +310,13 @@ impl DaubApp {
             _ => return false,
         };
         let p = self.view.to_canvas(pos);
+        if !right && let Some(handle) = self.canvas_handle_at(pos) {
+            self.commit_pending();
+            let (w, h) = (self.doc.width(), self.doc.height());
+            let edge = handle_points(Rect::from_min_size(Pos2::ZERO, vec2(w as f32, h as f32)))[handle];
+            self.op = Op::CanvasResize { handle, size: (w, h), off: edge - p };
+            return true;
+        }
         let (fg, _bg) = if right { (self.secondary, self.primary) } else { (self.primary, self.secondary) };
 
         match self.tool {
@@ -335,6 +373,11 @@ impl DaubApp {
                 return false;
             }
             Tool::Select => {
+                if let Some(handle) = self.selection_handle_at(pos) {
+                    let r = self.pending_selection().unwrap().current_rect();
+                    self.op = Op::SelectionHandle { handle, min0: r.min, max0: r.max };
+                    return true;
+                }
                 if let Some(s) = self.pending_selection()
                     && s.current_rect().contains(p) {
                         let orig = s.pos;
@@ -440,24 +483,7 @@ impl DaubApp {
                 self.rerender_pending();
             }
             Op::ShapeHandle { handle, min0, max0 } => {
-                let q = snap(p);
-                let (mut mn, mut mx) = (*min0, *max0);
-                match handle {
-                    0 => mn = q,
-                    1 => mn.y = q.y,
-                    2 => {
-                        mn.y = q.y;
-                        mx.x = q.x;
-                    }
-                    3 => mx.x = q.x,
-                    4 => mx = q,
-                    5 => mx.y = q.y,
-                    6 => {
-                        mn.x = q.x;
-                        mx.y = q.y;
-                    }
-                    _ => mn.x = q.x,
-                }
+                let (mn, mx) = drag_handle(*handle, *min0, *max0, snap(p));
                 if let Some(Pending { kind: PendingKind::Shape(s), .. }) = &mut self.pending {
                     s.a = mn;
                     s.b = mx;
@@ -502,6 +528,26 @@ impl DaubApp {
                 self.rerender_pending();
             }
             Op::TextBox { end, .. } => *end = p,
+            Op::CanvasResize { handle, size, off } => {
+                let p = p + *off;
+                let clamp = |v: f32| (v.round().max(1.0) as u32).min(raster::MAX_DIM);
+                if *handle != 5 {
+                    size.0 = clamp(p.x);
+                }
+                if *handle != 3 {
+                    size.1 = clamp(p.y);
+                }
+            }
+            Op::SelectionHandle { handle, min0, max0 } => {
+                let (mn, mx) = drag_handle(*handle, *min0, *max0, p.round());
+                let r = Rect::from_two_pos(mn, mx);
+                let (w, h) = (r.width().max(1.0) as u32, r.height().max(1.0) as u32);
+                let cur = self.pending_selection().map(|s| (s.pos, s.rect.width(), s.rect.height()));
+                let pos = (r.min.x as i32, r.min.y as i32);
+                if cur != Some((pos, w, h)) {
+                    self.scale_selection(pos, w, h);
+                }
+            }
             Op::TextMove { grab, orig } => {
                 let d = (p - *grab).round();
                 if let Some(Pending { kind: PendingKind::Text(t), .. }) = &mut self.pending {
@@ -537,6 +583,7 @@ impl DaubApp {
                 }
             }
             Op::SelectFree { points } => self.finish_free_selection(points),
+            Op::CanvasResize { size, .. } => self.set_canvas_size(size.0, size.1),
             Op::TextBox { start, end } => {
                 let mut r = Rect::from_two_pos(start, end);
                 let line = self.text_style.px() * 1.3;
@@ -556,6 +603,50 @@ impl DaubApp {
             _ => {}
         }
         self.mark_changed();
+    }
+
+    fn canvas_rect_screen(&self) -> Rect {
+        self.view.rect_to_screen(Rect::from_min_size(
+            Pos2::ZERO,
+            vec2(self.doc.width() as f32, self.doc.height() as f32),
+        ))
+    }
+
+    /// Screen position of each canvas-resize handle, with its index.
+    fn canvas_handles(&self) -> [(usize, Pos2); 3] {
+        let pts = handle_points(self.canvas_rect_screen().expand(4.0));
+        CANVAS_HANDLES.map(|i| (i, pts[i]))
+    }
+
+    /// A canvas handle under `pos`, unless a pending shape/selection handle is there too.
+    fn canvas_handle_at(&self, pos: Pos2) -> Option<usize> {
+        let near = |p: Pos2| self.view.to_screen(p).distance(pos) <= HANDLE_PX;
+        let object_handle = match &self.pending {
+            Some(Pending { kind: PendingKind::Selection(s), .. }) => handle_points(s.current_rect()).into_iter().any(near),
+            Some(Pending { kind: PendingKind::Shape(s), .. }) => {
+                [s.a, s.b].into_iter().chain(handle_points(s.bbox())).any(near)
+            }
+            _ => false,
+        };
+        if object_handle {
+            return None;
+        }
+        self.canvas_handles().into_iter().find(|(_, h)| h.distance(pos) <= HANDLE_PX).map(|(i, _)| i)
+    }
+
+    fn selection_handle_at(&self, pos: Pos2) -> Option<usize> {
+        if self.tool != Tool::Select {
+            return None;
+        }
+        // Smaller reach than shape handles so small selections can still be grabbed.
+        let r = self.view.rect_to_screen(self.pending_selection()?.current_rect());
+        handle_points(r)
+            .into_iter()
+            .enumerate()
+            .map(|(i, h)| (i, h.distance(pos)))
+            .filter(|(_, d)| *d <= 5.0)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(i, _)| i)
     }
 
     fn finish_free_selection(&mut self, points: Vec<Pos2>) {
@@ -611,7 +702,8 @@ impl DaubApp {
                 }
             }
         } else {
-            raster::stamp_square(&mut self.doc, x, y, size, raster::premul(self.secondary));
+            let c = raster::premul(self.erase_color());
+            raster::stamp_square(&mut self.doc, x, y, size, c);
         }
     }
 
@@ -659,6 +751,18 @@ impl DaubApp {
             _ => {}
         }
 
+        // Canvas resize handles, and the new outline while dragging one.
+        if let Op::CanvasResize { size, .. } = &self.op {
+            let r = Rect::from_min_size(Pos2::ZERO, vec2(size.0 as f32, size.1 as f32));
+            ants(painter, &rect_pts(v.rect_to_screen(r)));
+        } else {
+            for (_, h) in self.canvas_handles() {
+                let r = Rect::from_center_size(h, vec2(7.0, 7.0));
+                painter.rect_filled(r, 1.0, Color32::WHITE);
+                painter.rect_stroke(r, 1.0, Stroke::new(1.0, Color32::from_gray(110)), StrokeKind::Inside);
+            }
+        }
+
         let text_info = self.pending_text();
         match &self.pending {
             Some(Pending { kind: PendingKind::Selection(s), .. }) => {
@@ -673,6 +777,11 @@ impl DaubApp {
                         ants(painter, &pts);
                     }
                     None => ants(painter, &rect_pts(v.rect_to_screen(r))),
+                }
+                if self.tool == Tool::Select && !matches!(self.op, Op::MoveSelection { .. }) {
+                    for h in handle_points(v.rect_to_screen(r)) {
+                        handle(painter, h);
+                    }
                 }
             }
             Some(Pending { kind: PendingKind::Shape(s), .. }) => {
@@ -718,7 +827,7 @@ impl DaubApp {
                     let half = ((s as i32 - 1) / 2) as f32;
                     let r = Rect::from_min_size(pos2(x as f32 - half, y as f32 - half), vec2(s, s));
                     let sr = self.view.rect_to_screen(r);
-                    painter.rect_filled(sr, 0.0, self.secondary);
+                    painter.rect_filled(sr, 0.0, self.erase_color());
                     painter.rect_stroke(sr, 0.0, Stroke::new(1.0, Color32::from_gray(60)), StrokeKind::Outside);
                 }
                 _ => {}
@@ -735,13 +844,17 @@ impl DaubApp {
         let icon = match &self.op {
             Op::Pan { .. } => CursorIcon::Grabbing,
             Op::MoveSelection { .. } | Op::ShapeMove { .. } | Op::TextMove { .. } => CursorIcon::Move,
-            Op::ShapeHandle { handle, .. } => handle_cursor(*handle),
+            Op::ShapeHandle { handle, .. }
+            | Op::CanvasResize { handle, .. }
+            | Op::SelectionHandle { handle, .. } => handle_cursor(*handle),
             _ => {
                 let Some(h) = hover else { return };
                 let p = self.view.to_canvas(h);
                 let editing_text = matches!(self.pending, Some(Pending { kind: PendingKind::Text(_), .. }));
                 if space && !editing_text {
                     CursorIcon::Grab
+                } else if let Some(i) = self.canvas_handle_at(h).or_else(|| self.selection_handle_at(h)) {
+                    handle_cursor(i)
                 } else {
                     match self.tool {
                         Tool::Select if self.pending_selection().is_some_and(|s| s.current_rect().contains(p)) => {
@@ -816,7 +929,11 @@ impl DaubApp {
             small(ui, sel.map(|(w, h)| format!("{w} × {h}px")).unwrap_or_default());
             ui.add_space(16.0);
             small(ui, ic::FRAME_CORNERS.to_string());
-            small(ui, format!("{} × {}px", self.doc.width(), self.doc.height()));
+            let size = match &self.op {
+                Op::CanvasResize { size, .. } => *size,
+                _ => (self.doc.width(), self.doc.height()),
+            };
+            small(ui, format!("{} × {}px", size.0, size.1));
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button(ic::CORNERS_OUT).on_hover_text("Fit to window (⌘9)").clicked() {

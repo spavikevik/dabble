@@ -4,6 +4,8 @@
 use egui::{Color32, Event, Key, Modifiers, PointerButton, Pos2, RawInput, Rect, pos2, vec2};
 
 use crate::app::{DaubApp, PendingKind, SelectMode, Tool};
+use crate::dialogs::Dialog;
+use crate::menu::Action;
 use crate::raster;
 use crate::shapes::ShapeKind;
 
@@ -313,6 +315,191 @@ fn undo_cancels_pending_selection_move() {
     assert_eq!(h.px(50, 50), Color32::WHITE);
 }
 
+fn act(h: &mut H, a: Action) {
+    let ctx = h.ctx.clone();
+    h.app.perform(a, &ctx);
+    h.frame(vec![]);
+}
+
+/// Drag between two screen positions.
+fn drag_screen(h: &mut H, from: Pos2, to: Pos2) {
+    h.frame(vec![Event::PointerMoved(from)]);
+    h.frame(vec![
+        Event::PointerMoved(from),
+        Event::PointerButton { pos: from, button: L, pressed: true, modifiers: Modifiers::NONE },
+    ]);
+    for i in 1..=8 {
+        h.frame(vec![Event::PointerMoved(from + (to - from) * (i as f32 / 8.0))]);
+    }
+    h.frame(vec![
+        Event::PointerMoved(to),
+        Event::PointerButton { pos: to, button: L, pressed: false, modifiers: Modifiers::NONE },
+    ]);
+}
+
+#[test]
+fn rotate_and_flip_whole_image_with_undo() {
+    let mut h = H::new();
+    raster::set_px(&mut h.app.doc, 0, 0, raster::premul(RED));
+    act(&mut h, Action::RotateRight);
+    assert_eq!((h.app.doc.width(), h.app.doc.height()), (150, 200));
+    assert_eq!(h.px(149, 0), RED, "top-left goes to top-right");
+    act(&mut h, Action::FlipHorizontal);
+    assert_eq!(h.px(0, 0), RED);
+    act(&mut h, Action::FlipVertical);
+    assert_eq!(h.px(0, 199), RED);
+    act(&mut h, Action::Rotate180);
+    assert_eq!(h.px(149, 0), RED);
+    act(&mut h, Action::RotateLeft);
+    assert_eq!((h.app.doc.width(), h.app.doc.height()), (200, 150));
+    for _ in 0..5 {
+        h.key(Key::Z, Modifiers::COMMAND);
+    }
+    assert_eq!((h.app.doc.width(), h.app.doc.height()), (200, 150));
+    assert_eq!(h.px(0, 0), RED);
+    assert!(!h.app.is_dirty());
+}
+
+#[test]
+fn rotate_applies_to_selection_only() {
+    let mut h = H::new();
+    raster::set_px(&mut h.app.doc, 10, 10, raster::premul(RED));
+    h.app.set_tool(Tool::Select);
+    h.drag((10.0, 10.0), (50.0, 30.0), L); // 40×20 selection
+    act(&mut h, Action::RotateRight);
+    assert_eq!((h.app.doc.width(), h.app.doc.height()), (200, 150), "canvas unchanged");
+    let s = h.app.pending_selection().unwrap();
+    assert_eq!((s.rect.width(), s.rect.height()), (20, 40));
+    // Centered on (30, 20): new top-left (20, 0); red pixel lands at top-right.
+    assert_eq!(s.pos, (20, 0));
+    assert_eq!(h.px(39, 0), RED);
+    assert_eq!(h.px(10, 10), Color32::WHITE, "hole left behind");
+    h.key(Key::Enter, Modifiers::NONE);
+    h.key(Key::Z, Modifiers::COMMAND);
+    assert_eq!(h.px(10, 10), RED);
+    assert_eq!(h.px(39, 0), Color32::WHITE);
+}
+
+#[test]
+fn crop_to_selection() {
+    let mut h = H::new();
+    raster::set_px(&mut h.app.doc, 30, 40, raster::premul(RED));
+    h.app.set_tool(Tool::Select);
+    h.drag((20.0, 30.0), (70.0, 60.0), L);
+    act(&mut h, Action::Crop);
+    assert_eq!((h.app.doc.width(), h.app.doc.height()), (50, 30));
+    assert_eq!(h.px(10, 10), RED);
+    assert!(h.app.pending.is_none());
+    h.key(Key::Z, Modifiers::COMMAND);
+    assert_eq!((h.app.doc.width(), h.app.doc.height()), (200, 150));
+    assert_eq!(h.px(30, 40), RED);
+}
+
+#[test]
+fn crop_free_form_fills_outside_with_background() {
+    let mut h = H::new();
+    h.app.primary = RED;
+    h.app.set_tool(Tool::Fill);
+    h.click(5.0, 5.0, L);
+    let r = tiny_skia::IntRect::from_xywh(10, 10, 4, 4).unwrap();
+    let mut mask = vec![255u8; 16];
+    mask[0] = 0; // top-left pixel not selected
+    h.app.start_selection(r, Some(vec![]), Some(mask));
+    h.app.transparent_bg = true;
+    act(&mut h, Action::Crop);
+    assert_eq!((h.app.doc.width(), h.app.doc.height()), (4, 4));
+    assert_eq!(h.px(0, 0), Color32::TRANSPARENT);
+    assert_eq!(h.px(1, 0), RED);
+}
+
+#[test]
+fn drag_canvas_handle_resizes_canvas() {
+    let mut h = H::new();
+    h.app.primary = RED;
+    h.app.set_tool(Tool::Fill);
+    h.click(5.0, 5.0, L);
+    // Bottom-right handle sits 4px outside the canvas corner.
+    let from = h.s(200.0, 150.0) + vec2(4.0, 4.0);
+    let to = h.s(250.0, 100.0) + vec2(4.0, 4.0);
+    drag_screen(&mut h, from, to);
+    assert_eq!((h.app.doc.width(), h.app.doc.height()), (250, 100));
+    assert_eq!(h.px(199, 99), RED);
+    assert_eq!(h.px(220, 50), Color32::WHITE, "new space is white");
+    // Right-edge handle, transparent background.
+    h.app.transparent_bg = true;
+    let from = h.s(250.0, 50.0) + vec2(4.0, 0.0);
+    let to = h.s(260.0, 50.0) + vec2(4.0, 0.0);
+    drag_screen(&mut h, from, to);
+    assert_eq!((h.app.doc.width(), h.app.doc.height()), (260, 100));
+    assert_eq!(h.px(255, 50), Color32::TRANSPARENT);
+    h.key(Key::Z, Modifiers::COMMAND);
+    h.key(Key::Z, Modifiers::COMMAND);
+    assert_eq!((h.app.doc.width(), h.app.doc.height()), (200, 150));
+}
+
+#[test]
+fn drag_selection_handle_scales_pixels() {
+    let mut h = H::new();
+    h.app.primary = RED;
+    h.app.set_tool(Tool::Fill);
+    h.click(5.0, 5.0, L); // all red
+    h.app.set_tool(Tool::Select);
+    h.drag((10.0, 10.0), (20.0, 20.0), L); // 10×10
+    // Drag the bottom-right handle out to (40, 30).
+    h.drag((20.0, 20.0), (40.0, 30.0), L);
+    let s = h.app.pending_selection().unwrap();
+    assert_eq!((s.pos, s.rect.width(), s.rect.height()), ((10, 10), 30, 20));
+    assert_eq!(h.px(35, 25), RED, "scaled selection covers new area");
+    assert_eq!(h.px(15, 15), RED);
+    h.key(Key::Z, Modifiers::COMMAND);
+    assert!(h.app.pending.is_none());
+}
+
+#[test]
+fn resize_dialog_scales_image() {
+    let mut h = H::new();
+    act(&mut h, Action::ResizeSkew);
+    let Some(Dialog::Resize(d)) = &mut h.app.dialog else { panic!("dialog open") };
+    d.horiz = 50.0;
+    d.vert = 50.0;
+    // Canvas input is blocked while the dialog is up.
+    h.app.set_tool(Tool::Pencil);
+    h.drag((10.5, 10.5), (40.5, 10.5), L);
+    assert_eq!(h.px(20, 10), Color32::WHITE);
+    h.key(Key::Enter, Modifiers::NONE);
+    assert!(h.app.dialog.is_none());
+    assert_eq!((h.app.doc.width(), h.app.doc.height()), (100, 75));
+}
+
+#[test]
+fn skew_and_escape_cancels_dialog() {
+    let mut h = H::new();
+    act(&mut h, Action::ResizeSkew);
+    h.key(Key::Escape, Modifiers::NONE);
+    assert!(h.app.dialog.is_none());
+    assert_eq!((h.app.doc.width(), h.app.doc.height()), (200, 150));
+    h.app.resize_and_skew(200, 150, 45.0, 0.0);
+    assert_eq!((h.app.doc.width(), h.app.doc.height()), (350, 150));
+}
+
+#[test]
+fn properties_dialog_sets_size_and_transparency() {
+    let mut h = H::new();
+    act(&mut h, Action::ImageProperties);
+    let Some(Dialog::Properties(d)) = &mut h.app.dialog else { panic!("dialog open") };
+    d.w = 120;
+    d.h = 300;
+    d.transparent = true;
+    h.key(Key::Enter, Modifiers::NONE);
+    assert_eq!((h.app.doc.width(), h.app.doc.height()), (120, 300));
+    assert!(h.app.transparent_bg);
+    assert_eq!(h.px(10, 200), Color32::TRANSPARENT);
+    // Eraser now erases to transparent.
+    h.app.set_tool(Tool::Eraser);
+    h.click(10.5, 10.5, L);
+    assert_eq!(h.px(10, 10), Color32::TRANSPARENT);
+}
+
 /// Renders the real UI offscreen to PNG files (for eyeballing the layout):
 /// `DAUB_SHOT_DIR=/some/dir cargo test render_screenshots -- --ignored`
 #[test]
@@ -385,4 +572,37 @@ fn render_screenshots() {
         harness.step();
     }
     harness.render().unwrap().save(dir.join("daub-text.png")).unwrap();
+
+    // Rotated, scaled selection with handles.
+    {
+        let a = harness.state_mut().as_mut().unwrap();
+        a.commit_pending();
+        a.set_tool(Tool::Select);
+        a.start_selection(tiny_skia::IntRect::from_xywh(640, 110, 220, 210).unwrap(), None, None);
+    }
+    harness.run();
+    {
+        let a = harness.state_mut().as_mut().unwrap();
+        a.ribbon_actions.push(Action::RotateRight);
+    }
+    harness.run();
+    {
+        let a = harness.state_mut().as_mut().unwrap();
+        let s = a.pending_selection().unwrap();
+        let (pos, w, h) = (s.pos, s.rect.width(), s.rect.height());
+        a.scale_selection((pos.0 + 60, pos.1), w + 80, h);
+    }
+    for _ in 0..3 {
+        harness.step();
+    }
+    harness.render().unwrap().save(dir.join("daub-selection.png")).unwrap();
+
+    {
+        let a = harness.state_mut().as_mut().unwrap();
+        a.ribbon_actions.push(Action::ResizeSkew);
+    }
+    for _ in 0..5 {
+        harness.step();
+    }
+    harness.render().unwrap().save(dir.join("daub-resize.png")).unwrap();
 }

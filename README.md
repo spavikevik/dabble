@@ -9,7 +9,7 @@ cargo run --release            # empty canvas
 cargo run --release -- pic.png # open a file
 ```
 
-## What works (phases 1–2)
+## What works
 
 - Canvas: zoom (pinch, ⌘-scroll, ⌘=/⌘-, ⌘0 for 100%, ⌘9 to fit, magnifier tool, zoom slider), pan (scroll, middle-drag, Space+drag)
 - Tools: pencil, brush, eraser (right-drag replaces only Color 1 with Color 2), fill, color picker, magnifier, text
@@ -18,6 +18,9 @@ cargo run --release -- pic.png # open a file
 - Selection: rectangle and free-form. Move, delete, select all, transparent selection, cut/copy/paste through the system clipboard (pasting a larger image grows the canvas)
 - Text: system fonts, size, bold/italic/underline/strikethrough, transparent or filled background, word wrap, arrow keys, paste
 - Undo/redo (stores only the changed area), unsaved-changes prompt, open/save PNG, JPEG, BMP, GIF, TIFF, WebP, drag-and-drop to open
+- Image: crop to selection (⌘K), resize and skew by percent or pixels (⌥⌘I), rotate right/left (⌘R/⌘L) and 180°, flip horizontal/vertical, image properties (⌘E). These act on the selection if there is one, otherwise on the whole image.
+- Drag the selection's handles to scale it. Drag the canvas's right, bottom or corner handle to resize the canvas.
+- Transparent background (Image menu or Image Properties): eraser, Delete and new canvas space leave transparent pixels. Turns on by itself when you open an image that has transparency.
 - Native macOS menu bar with standard shortcuts
 
 ## Tests

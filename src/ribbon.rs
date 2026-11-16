@@ -31,6 +31,14 @@ const PALETTE: [[u8; 3]; 20] = [
     [0xce, 0x93, 0xd8],
 ];
 
+const ROTATE_ACTIONS: [Action; 5] = [
+    Action::RotateRight,
+    Action::RotateLeft,
+    Action::Rotate180,
+    Action::FlipVertical,
+    Action::FlipHorizontal,
+];
+
 const FONT_SIZES: [f32; 16] = [8., 9., 10., 11., 12., 14., 16., 18., 20., 22., 24., 28., 36., 48., 72., 96.];
 
 #[derive(PartialEq)]
@@ -151,6 +159,18 @@ impl DaubApp {
                 ui.separator();
                 self.menu_item(ui, Action::SelectAll, true);
             });
+            ui.menu_button("Image", |ui| {
+                self.menu_item(ui, Action::Crop, has_sel);
+                self.menu_item(ui, Action::ResizeSkew, true);
+                ui.separator();
+                for a in ROTATE_ACTIONS {
+                    self.menu_item(ui, a, true);
+                }
+                ui.separator();
+                self.menu_item(ui, Action::ImageProperties, true);
+                ui.checkbox(&mut self.transparent_bg, "Transparent background")
+                    .on_hover_text("Eraser, Delete and new canvas space leave transparent pixels");
+            });
             ui.menu_button("View", |ui| {
                 self.menu_item(ui, Action::ZoomIn, true);
                 self.menu_item(ui, Action::ZoomOut, true);
@@ -178,6 +198,8 @@ impl DaubApp {
         egui::ScrollArea::horizontal().id_salt("ribbon-scroll").show(ui, |ui| {
             ui.horizontal(|ui| {
                 self.selection_group(ui, has_sel);
+                divider(ui);
+                self.image_group(ui, has_sel);
                 divider(ui);
                 self.tools_group(ui);
                 divider(ui);
@@ -235,6 +257,36 @@ impl DaubApp {
                 ui.separator();
                 ui.checkbox(&mut self.transparent_selection, "Transparent selection")
                     .on_hover_text("When moving a selection, Color 2 pixels become see-through");
+            });
+        });
+    }
+
+    fn image_group(&mut self, ui: &mut Ui, has_sel: bool) {
+        group(ui, "Image", |ui| {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(has_sel, |ui| {
+                        if icon_button(ui, ic::CROP, false, 30.0, "Crop to selection (⌘K)").clicked() {
+                            self.ribbon_actions.push(Action::Crop);
+                        }
+                    });
+                    if icon_button(ui, ic::ARROWS_OUT, false, 30.0, "Resize and skew (⌥⌘I)").clicked() {
+                        self.ribbon_actions.push(Action::ResizeSkew);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let r = icon_button(ui, ic::ARROW_CLOCKWISE, false, 30.0, "Rotate and flip");
+                    egui::Popup::menu(&r).show(|ui| {
+                        ui.set_min_width(200.0);
+                        for a in ROTATE_ACTIONS {
+                            self.menu_item(ui, a, true);
+                        }
+                    });
+                    if icon_button(ui, ic::IMAGE, false, 30.0, "Image properties (⌘E)").clicked() {
+                        self.ribbon_actions.push(Action::ImageProperties);
+                    }
+                });
             });
         });
     }

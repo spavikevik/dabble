@@ -65,8 +65,17 @@ impl View {
 pub struct Lifted {
     /// Document with the selected pixels removed.
     pub hole: Pixmap,
-    /// The selected pixels, moving with the selection.
+    /// The selected pixels as last rotated/flipped/skewed, before any
+    /// handle-drag scaling. Scaling always starts from this to avoid blur build-up.
+    pub source: Pixmap,
+    /// The selected pixels as shown, moving with the selection.
     pub floating: Pixmap,
+}
+
+impl Lifted {
+    pub fn new(hole: Pixmap, floating: Pixmap) -> Self {
+        Self { hole, source: floating.clone(), floating }
+    }
 }
 
 pub struct Selection {
@@ -147,6 +156,10 @@ pub struct DaubApp {
     pub shape_fill: bool,
     pub select_mode: SelectMode,
     pub transparent_selection: bool,
+    /// Erasing, deleting and growing the canvas leave transparent pixels
+    /// instead of Color 2 / white.
+    pub transparent_bg: bool,
+    pub dialog: Option<crate::dialogs::Dialog>,
     pub text_style: TextStyle,
     pub fonts: Option<Fonts>,
 
@@ -210,6 +223,8 @@ impl DaubApp {
             shape_fill: false,
             select_mode: SelectMode::Rect,
             transparent_selection: false,
+            transparent_bg: false,
+            dialog: None,
             text_style: TextStyle {
                 family: String::new(),
                 size_pt: 18.0,
@@ -296,6 +311,16 @@ impl DaubApp {
             Tool::Shape => Some(&mut self.sizes.shape),
             _ => None,
         }
+    }
+
+    /// What new canvas space is filled with.
+    pub fn canvas_bg(&self) -> Color32 {
+        if self.transparent_bg { Color32::TRANSPARENT } else { Color32::WHITE }
+    }
+
+    /// What the eraser, Delete and a moved selection leave behind.
+    pub fn erase_color(&self) -> Color32 {
+        if self.transparent_bg { Color32::TRANSPARENT } else { self.secondary }
     }
 
     pub fn set_active_color(&mut self, c: Color32) {
@@ -405,6 +430,7 @@ impl DaubApp {
     /// Cut the selected pixels out of the document so they can move.
     pub fn lift_selection(&mut self) {
         let secondary = self.secondary;
+        let erase = self.erase_color();
         let transparent = self.transparent_selection;
         let Some(Pending { kind: PendingKind::Selection(s), .. }) = &mut self.pending else { return };
         if s.lifted.is_some() {
@@ -415,8 +441,8 @@ impl DaubApp {
             raster::key_out(&mut floating, secondary);
         }
         let mut hole = self.doc.clone();
-        raster::fill_region(&mut hole, s.rect, s.mask.as_deref(), secondary);
-        s.lifted = Some(Lifted { hole, floating });
+        raster::fill_region(&mut hole, s.rect, s.mask.as_deref(), erase);
+        s.lifted = Some(Lifted::new(hole, floating));
         self.rerender_pending();
     }
 
@@ -434,6 +460,7 @@ impl DaubApp {
         match a {
             Action::New => {
                 if self.confirm_discard() {
+                    self.transparent_bg = false;
                     self.replace_doc(raster::new_canvas(DEFAULT_W, DEFAULT_H, Color32::WHITE), None);
                 }
             }
@@ -469,6 +496,14 @@ impl DaubApp {
                 self.zoom_at(1.0, c);
             }
             Action::ZoomFit => self.view.fit_next = true,
+            Action::Crop => self.crop(),
+            Action::ResizeSkew => self.open_resize_dialog(),
+            Action::ImageProperties => self.open_properties_dialog(),
+            Action::RotateRight => self.transform(|pm, _| Some(raster::rotate90(pm, true))),
+            Action::RotateLeft => self.transform(|pm, _| Some(raster::rotate90(pm, false))),
+            Action::Rotate180 => self.transform(|pm, _| Some(raster::rotate180(pm))),
+            Action::FlipHorizontal => self.transform(|pm, _| Some(raster::flip(pm, true))),
+            Action::FlipVertical => self.transform(|pm, _| Some(raster::flip(pm, false))),
         }
     }
 
@@ -512,13 +547,13 @@ impl DaubApp {
     }
 
     pub fn delete_selection(&mut self) {
-        let secondary = self.secondary;
+        let erase = self.erase_color();
         let Some(Pending { kind: PendingKind::Selection(s), .. }) = &self.pending else { return };
         match &s.lifted {
             Some(l) => raster::restore(&mut self.doc, &l.hole),
             None => {
                 let (rect, mask) = (s.rect, s.mask.clone());
-                raster::fill_region(&mut self.doc, rect, mask.as_deref(), secondary);
+                raster::fill_region(&mut self.doc, rect, mask.as_deref(), erase);
             }
         }
         self.commit_pending();
@@ -538,7 +573,7 @@ impl DaubApp {
         };
         self.commit_pending();
         if pm.width() > self.doc.width() || pm.height() > self.doc.height() {
-            let grown = raster::grow(&self.doc, pm.width(), pm.height(), Color32::WHITE);
+            let grown = raster::grow(&self.doc, pm.width(), pm.height(), self.canvas_bg());
             self.history.record(&self.doc, &grown);
             self.doc = grown;
         }
@@ -554,7 +589,7 @@ impl DaubApp {
                 rect,
                 outline: None,
                 mask: None,
-                lifted: Some(Lifted { hole: self.doc.clone(), floating: pm }),
+                lifted: Some(Lifted::new(self.doc.clone(), pm)),
                 pos: (x, y),
             }),
         });
@@ -569,6 +604,101 @@ impl DaubApp {
             }
             self.rerender_pending();
         }
+    }
+
+    // ---------------------------------------------------------- image ops
+
+    /// Apply `f` to the selection if there is one, otherwise to the whole
+    /// image. `f` gets the pixels and the color for uncovered space.
+    pub fn transform(&mut self, f: impl Fn(&Pixmap, Color32) -> Option<Pixmap>) {
+        if self.pending_selection().is_some() {
+            self.lift_selection();
+            let Some(Pending { kind: PendingKind::Selection(s), .. }) = &mut self.pending else { return };
+            // Keep the selection centered where it was.
+            let c = s.current_rect().center();
+            let Some(l) = &mut s.lifted else { return };
+            let Some(new) = f(&l.floating, Color32::TRANSPARENT) else {
+                error_dialog("Daub", "The result would be too large.");
+                return;
+            };
+            let (w, h) = (new.width(), new.height());
+            s.pos = ((c.x - w as f32 / 2.0).round() as i32, (c.y - h as f32 / 2.0).round() as i32);
+            s.rect = IntRect::from_xywh(s.rect.x(), s.rect.y(), w, h).unwrap();
+            s.outline = None;
+            s.mask = None;
+            l.source = new.clone();
+            l.floating = new;
+            self.rerender_pending();
+        } else {
+            self.commit_pending();
+            match f(&self.doc, self.canvas_bg()) {
+                Some(new) => self.set_doc(new),
+                None => error_dialog("Daub", "The result would be too large."),
+            }
+        }
+    }
+
+    /// Replace the document with an edited version as one undo step.
+    pub fn set_doc(&mut self, new: Pixmap) {
+        if self.history.record(&self.doc, &new) {
+            self.doc = new;
+            self.mark_changed();
+        }
+    }
+
+    /// Scale the lifted selection to `w`×`h` from its unscaled source.
+    pub fn scale_selection(&mut self, pos: (i32, i32), w: u32, h: u32) {
+        self.lift_selection();
+        let Some(Pending { kind: PendingKind::Selection(s), .. }) = &mut self.pending else { return };
+        let Some(l) = &mut s.lifted else { return };
+        let Some(new) = raster::scale(&l.source, w, h) else { return };
+        l.floating = new;
+        s.pos = pos;
+        s.rect = IntRect::from_xywh(s.rect.x(), s.rect.y(), w, h).unwrap();
+        s.outline = None;
+        s.mask = None;
+        self.rerender_pending();
+    }
+
+    /// Crop the image to the selection.
+    pub fn crop(&mut self) {
+        let bg = self.canvas_bg();
+        let Some(Pending { kind: PendingKind::Selection(s), .. }) = &self.pending else { return };
+        let content = match &s.lifted {
+            Some(l) => Some(l.floating.clone()),
+            None => raster::extract(&self.doc, s.rect, s.mask.as_deref()),
+        };
+        let Some(content) = content else { return };
+        let out = if s.mask.is_none() && s.lifted.is_none() {
+            content
+        } else {
+            // Free-form or moved: put what's selected on a fresh background.
+            let mut out = raster::new_canvas(content.width(), content.height(), bg);
+            raster::draw_over(&mut out, &content, 0, 0);
+            out
+        };
+        let p = self.pending.take().unwrap();
+        self.doc = p.base;
+        self.set_doc(out);
+        self.mark_changed();
+    }
+
+    pub fn set_canvas_size(&mut self, w: u32, h: u32) {
+        self.commit_pending();
+        if (w, h) == (self.doc.width(), self.doc.height()) {
+            return;
+        }
+        if let Some(new) = raster::resize_canvas(&self.doc, w, h, self.canvas_bg()) {
+            self.set_doc(new);
+        }
+    }
+
+    /// Resize (to `w`×`h`) then skew the selection, or the whole image.
+    pub fn resize_and_skew(&mut self, w: u32, h: u32, skew_h: f32, skew_v: f32) {
+        self.transform(move |pm, bg| {
+            let scaled = raster::scale(pm, w, h)?;
+            raster::skew(&scaled, skew_h, skew_v, bg)
+        });
     }
 
     // ----------------------------------------------------------------- view
@@ -629,7 +759,10 @@ impl DaubApp {
 
     pub fn open_path(&mut self, p: PathBuf) {
         match io::load(&p) {
-            Ok(pm) => self.replace_doc(pm, Some(p)),
+            Ok(pm) => {
+                self.transparent_bg = raster::has_transparency(&pm);
+                self.replace_doc(pm, Some(p));
+            }
             Err(e) => error_dialog(&format!("Couldn't open {}", p.display()), &e),
         }
     }
@@ -729,6 +862,10 @@ impl DaubApp {
             None => menu::egui_shortcuts(&ctx),
         };
         actions.append(&mut self.ribbon_actions);
+        if self.dialog.is_some() {
+            // A dialog is up: only quitting gets through.
+            actions.retain(|a| *a == Action::Quit);
+        }
         for a in actions {
             self.perform(a, &ctx);
         }
@@ -766,5 +903,6 @@ impl DaubApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(theme::CANVAS_AREA_BG))
             .show(ui, |ui| self.canvas_ui(ui));
+        self.dialog_ui(&ctx);
     }
 }

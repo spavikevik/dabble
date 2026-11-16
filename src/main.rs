@@ -1,5 +1,6 @@
 mod app;
 mod canvas;
+mod dialogs;
 mod history;
 mod io;
 mod menu;

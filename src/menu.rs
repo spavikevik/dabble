@@ -22,10 +22,18 @@ pub enum Action {
     ZoomOut,
     ZoomActual,
     ZoomFit,
+    Crop,
+    ResizeSkew,
+    RotateRight,
+    RotateLeft,
+    Rotate180,
+    FlipHorizontal,
+    FlipVertical,
+    ImageProperties,
 }
 
 impl Action {
-    const ALL: [Action; 16] = [
+    const ALL: [Action; 24] = [
         Action::New,
         Action::Open,
         Action::Save,
@@ -42,6 +50,14 @@ impl Action {
         Action::ZoomOut,
         Action::ZoomActual,
         Action::ZoomFit,
+        Action::Crop,
+        Action::ResizeSkew,
+        Action::RotateRight,
+        Action::RotateLeft,
+        Action::Rotate180,
+        Action::FlipHorizontal,
+        Action::FlipVertical,
+        Action::ImageProperties,
     ];
 
     fn id(self) -> String {
@@ -66,6 +82,14 @@ impl Action {
             Action::ZoomOut => "Zoom Out",
             Action::ZoomActual => "Actual Size",
             Action::ZoomFit => "Fit to Window",
+            Action::Crop => "Crop to Selection",
+            Action::ResizeSkew => "Resize and Skew…",
+            Action::RotateRight => "Rotate Right 90°",
+            Action::RotateLeft => "Rotate Left 90°",
+            Action::Rotate180 => "Rotate 180°",
+            Action::FlipHorizontal => "Flip Horizontal",
+            Action::FlipVertical => "Flip Vertical",
+            Action::ImageProperties => "Image Properties…",
         }
     }
 
@@ -86,7 +110,12 @@ impl Action {
             Action::ZoomOut => "CmdOrCtrl+Minus",
             Action::ZoomActual => "CmdOrCtrl+0",
             Action::ZoomFit => "CmdOrCtrl+9",
-            Action::Delete => return None,
+            Action::Crop => "CmdOrCtrl+K",
+            Action::ResizeSkew => "CmdOrCtrl+Alt+I",
+            Action::RotateRight => "CmdOrCtrl+R",
+            Action::RotateLeft => "CmdOrCtrl+L",
+            Action::ImageProperties => "CmdOrCtrl+E",
+            Action::Delete | Action::Rotate180 | Action::FlipHorizontal | Action::FlipVertical => return None,
         })
     }
 
@@ -96,6 +125,7 @@ impl Action {
             .map(|s| {
                 s.replace("CmdOrCtrl+", "⌘")
                     .replace("Shift+", "⇧")
+                    .replace("Alt+", "⌥")
                     .replace("Equal", "=")
                     .replace("Minus", "-")
             })
@@ -164,9 +194,23 @@ impl NativeMenu {
             &P::fullscreen(None),
         ])
         .ok()?;
+        let image = Submenu::new("Image", true);
+        image.append_items(&[
+            &item(Action::Crop),
+            &item(Action::ResizeSkew),
+            &P::separator(),
+            &item(Action::RotateRight),
+            &item(Action::RotateLeft),
+            &item(Action::Rotate180),
+            &item(Action::FlipHorizontal),
+            &item(Action::FlipVertical),
+            &P::separator(),
+            &item(Action::ImageProperties),
+        ])
+        .ok()?;
         let window = Submenu::new("Window", true);
         window.append_items(&[&P::minimize(None), &P::maximize(None)]).ok()?;
-        menu.append_items(&[&app, &file, &edit, &view, &window]).ok()?;
+        menu.append_items(&[&app, &file, &edit, &image, &view, &window]).ok()?;
         menu.init_for_nsapp();
         window.set_as_windows_menu_for_nsapp();
 
@@ -216,6 +260,11 @@ pub fn egui_shortcuts(ctx: &egui::Context) -> Vec<Action> {
         (K::new(M::COMMAND, Key::Minus), Action::ZoomOut),
         (K::new(M::COMMAND, Key::Num0), Action::ZoomActual),
         (K::new(M::COMMAND, Key::Num9), Action::ZoomFit),
+        (K::new(M::COMMAND | M::ALT, Key::I), Action::ResizeSkew),
+        (K::new(M::COMMAND, Key::K), Action::Crop),
+        (K::new(M::COMMAND, Key::R), Action::RotateRight),
+        (K::new(M::COMMAND, Key::L), Action::RotateLeft),
+        (K::new(M::COMMAND, Key::E), Action::ImageProperties),
     ];
     let mut out = vec![];
     ctx.input_mut(|i| {

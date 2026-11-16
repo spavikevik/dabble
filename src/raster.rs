@@ -276,3 +276,176 @@ pub fn grow(pm: &Pixmap, w: u32, h: u32, bg: Color32) -> Pixmap {
     copy_into(&mut out, pm, 0, 0);
     out
 }
+
+// ------------------------------------------------------------ transforms
+
+/// Largest width or height we allow for a canvas.
+pub const MAX_DIM: u32 = 16384;
+
+pub fn valid_size(w: u32, h: u32) -> bool {
+    (1..=MAX_DIM).contains(&w) && (1..=MAX_DIM).contains(&h)
+}
+
+/// Remap pixels: output pixel (x, y) of a `w`×`h` image comes from `src(x, y)`.
+fn remap(pm: &Pixmap, w: u32, h: u32, src: impl Fn(u32, u32) -> (u32, u32)) -> Pixmap {
+    let mut out = Pixmap::new(w, h).expect("size");
+    let sw = pm.width();
+    let sp = pm.pixels();
+    let op = out.pixels_mut();
+    for y in 0..h {
+        for x in 0..w {
+            let (sx, sy) = src(x, y);
+            op[(y * w + x) as usize] = sp[(sy * sw + sx) as usize];
+        }
+    }
+    out
+}
+
+/// Rotate a quarter turn: clockwise (right) or counter-clockwise (left).
+pub fn rotate90(pm: &Pixmap, clockwise: bool) -> Pixmap {
+    let (w, h) = (pm.width(), pm.height());
+    if clockwise {
+        remap(pm, h, w, |x, y| (y, h - 1 - x))
+    } else {
+        remap(pm, h, w, |x, y| (w - 1 - y, x))
+    }
+}
+
+pub fn rotate180(pm: &Pixmap) -> Pixmap {
+    let (w, h) = (pm.width(), pm.height());
+    remap(pm, w, h, |x, y| (w - 1 - x, h - 1 - y))
+}
+
+/// Mirror left-right (`horizontal`) or top-bottom.
+pub fn flip(pm: &Pixmap, horizontal: bool) -> Pixmap {
+    let (w, h) = (pm.width(), pm.height());
+    if horizontal {
+        remap(pm, w, h, |x, y| (w - 1 - x, y))
+    } else {
+        remap(pm, w, h, |x, y| (x, h - 1 - y))
+    }
+}
+
+/// Resample to `w`×`h` with a triangle filter. Works on premultiplied data,
+/// so transparent edges don't bleed dark fringes.
+pub fn scale(pm: &Pixmap, w: u32, h: u32) -> Option<Pixmap> {
+    if !valid_size(w, h) {
+        return None;
+    }
+    if (w, h) == (pm.width(), pm.height()) {
+        return Some(pm.clone());
+    }
+    let src = image::RgbaImage::from_raw(pm.width(), pm.height(), pm.data().to_vec())?;
+    let res = image::imageops::resize(&src, w, h, image::imageops::FilterType::Triangle);
+    let mut out = Pixmap::new(w, h)?;
+    for (d, s) in out.pixels_mut().iter_mut().zip(res.pixels()) {
+        let a = s[3];
+        *d = PremultipliedColorU8::from_rgba(s[0].min(a), s[1].min(a), s[2].min(a), a).unwrap();
+    }
+    Some(out)
+}
+
+/// Skew by the given angles in degrees (horizontal shifts rows, vertical shifts
+/// columns). The result grows to fit; uncovered space is filled with `bg`.
+pub fn skew(pm: &Pixmap, deg_x: f32, deg_y: f32, bg: Color32) -> Option<Pixmap> {
+    if deg_x == 0.0 && deg_y == 0.0 {
+        return Some(pm.clone());
+    }
+    let kx = deg_x.clamp(-89.0, 89.0).to_radians().tan();
+    let ky = deg_y.clamp(-89.0, 89.0).to_radians().tan();
+    let (w, h) = (pm.width() as f32, pm.height() as f32);
+    let t = Transform::from_row(1.0, ky, kx, 1.0, 0.0, 0.0);
+    let mut corners = [tiny_skia::Point::from_xy(0.0, 0.0), tiny_skia::Point::from_xy(w, 0.0),
+        tiny_skia::Point::from_xy(0.0, h), tiny_skia::Point::from_xy(w, h)];
+    t.map_points(&mut corners);
+    let minx = corners.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+    let miny = corners.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+    let maxx = corners.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
+    let maxy = corners.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
+    let (nw, nh) = ((maxx - minx).round() as u32, (maxy - miny).round() as u32);
+    if !valid_size(nw, nh) {
+        return None;
+    }
+    let mut out = new_canvas(nw, nh, bg);
+    let paint = PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..Default::default() };
+    out.draw_pixmap(0, 0, pm.as_ref(), &paint, t.post_translate(-minx, -miny), None);
+    Some(out)
+}
+
+/// Change the canvas size, keeping the image anchored top-left.
+pub fn resize_canvas(pm: &Pixmap, w: u32, h: u32, bg: Color32) -> Option<Pixmap> {
+    if !valid_size(w, h) {
+        return None;
+    }
+    let mut out = new_canvas(w, h, bg);
+    copy_into(&mut out, pm, 0, 0);
+    Some(out)
+}
+
+pub fn has_transparency(pm: &Pixmap) -> bool {
+    pm.pixels().iter().any(|p| p.alpha() < 255)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn numbered(w: u32, h: u32) -> Pixmap {
+        let mut pm = Pixmap::new(w, h).unwrap();
+        for (i, p) in pm.pixels_mut().iter_mut().enumerate() {
+            *p = PremultipliedColorU8::from_rgba(i as u8, 0, 0, 255).unwrap();
+        }
+        pm
+    }
+
+    fn at(pm: &Pixmap, x: u32, y: u32) -> u8 {
+        pm.pixel(x, y).unwrap().red()
+    }
+
+    #[test]
+    fn rotations_and_flips() {
+        // 3×2:  0 1 2
+        //       3 4 5
+        let pm = numbered(3, 2);
+        let r = rotate90(&pm, true);
+        assert_eq!((r.width(), r.height()), (2, 3));
+        // Clockwise: top row becomes 3 0.
+        assert_eq!((at(&r, 0, 0), at(&r, 1, 0)), (3, 0));
+        assert_eq!((at(&r, 0, 2), at(&r, 1, 2)), (5, 2));
+        let l = rotate90(&pm, false);
+        assert_eq!((at(&l, 0, 0), at(&l, 1, 0)), (2, 5));
+        assert_eq!(rotate90(&r, false).data(), pm.data());
+        assert_eq!(rotate90(&rotate90(&pm, true), true).data(), rotate180(&pm).data());
+        assert_eq!(at(&rotate180(&pm), 0, 0), 5);
+        let fh = flip(&pm, true);
+        assert_eq!((at(&fh, 0, 0), at(&fh, 2, 1)), (2, 3));
+        let fv = flip(&pm, false);
+        assert_eq!((at(&fv, 0, 0), at(&fv, 2, 1)), (3, 2));
+    }
+
+    #[test]
+    fn scale_and_canvas_resize() {
+        let pm = new_canvas(10, 4, Color32::RED);
+        let s = scale(&pm, 25, 2).unwrap();
+        assert_eq!((s.width(), s.height()), (25, 2));
+        assert!(s.pixels().iter().all(|p| from_premul(*p) == Color32::RED));
+        assert!(scale(&pm, 0, 5).is_none());
+        let c = resize_canvas(&pm, 12, 3, Color32::TRANSPARENT).unwrap();
+        assert_eq!(pixel(&c, 9, 2), Some(Color32::RED));
+        assert_eq!(pixel(&c, 10, 0), Some(Color32::TRANSPARENT));
+        assert!(has_transparency(&c));
+        assert!(!has_transparency(&pm));
+    }
+
+    #[test]
+    fn skew_grows_and_fills() {
+        let pm = new_canvas(10, 10, Color32::BLACK);
+        let s = skew(&pm, 45.0, 0.0, Color32::WHITE).unwrap();
+        assert_eq!((s.width(), s.height()), (20, 10));
+        // Top row shifted fully left, bottom row fully right.
+        assert_eq!(pixel(&s, 1, 0), Some(Color32::BLACK));
+        assert_eq!(pixel(&s, 18, 0), Some(Color32::WHITE));
+        assert_eq!(pixel(&s, 1, 9), Some(Color32::WHITE));
+        assert_eq!(pixel(&s, 18, 9), Some(Color32::BLACK));
+    }
+}

@@ -60,7 +60,7 @@ mod tests {
 
     #[test]
     fn roundtrip_png_and_jpg() {
-        let dir = std::env::temp_dir().join(format!("daub-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("dabble-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let mut pm = raster::new_canvas(8, 6, Color32::WHITE);
         raster::set_px(&mut pm, 2, 3, raster::premul(Color32::from_rgb(10, 200, 30)));

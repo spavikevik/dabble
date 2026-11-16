@@ -1,5 +1,6 @@
 //! Shape geometry. Every shape is defined inside a unit square and mapped onto
-//! the rectangle the user drags out, except `Line`, which uses its two endpoints.
+//! the rectangle the user drags out, except `Line`, `Curve` and `Polygon`,
+//! which are defined by their points.
 
 use egui::{Pos2, Rect, pos2};
 use tiny_skia::{Path, PathBuilder, PathSegment};
@@ -7,6 +8,8 @@ use tiny_skia::{Path, PathBuilder, PathSegment};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ShapeKind {
     Line,
+    Curve,
+    Polygon,
     Rect,
     RoundRect,
     Ellipse,
@@ -27,8 +30,10 @@ pub enum ShapeKind {
 }
 
 impl ShapeKind {
-    pub const ALL: [ShapeKind; 18] = [
+    pub const ALL: [ShapeKind; 20] = [
         ShapeKind::Line,
+        ShapeKind::Curve,
+        ShapeKind::Polygon,
         ShapeKind::Rect,
         ShapeKind::RoundRect,
         ShapeKind::Ellipse,
@@ -51,6 +56,8 @@ impl ShapeKind {
     pub fn name(self) -> &'static str {
         match self {
             ShapeKind::Line => "Line",
+            ShapeKind::Curve => "Curve (drag to draw, then drag twice to bend)",
+            ShapeKind::Polygon => "Polygon (drag the first side, click to add corners, click the start to close)",
             ShapeKind::Rect => "Rectangle",
             ShapeKind::RoundRect => "Rounded rectangle",
             ShapeKind::Ellipse => "Oval",
@@ -73,6 +80,16 @@ impl ShapeKind {
 
     pub fn is_line(self) -> bool {
         self == ShapeKind::Line
+    }
+
+    /// Open paths: never filled, drawn with round caps.
+    pub fn is_open(self) -> bool {
+        matches!(self, ShapeKind::Line | ShapeKind::Curve)
+    }
+
+    /// Edited by dragging its points rather than a bounding box.
+    pub fn by_points(self) -> bool {
+        matches!(self, ShapeKind::Line | ShapeKind::Curve | ShapeKind::Polygon)
     }
 
     pub fn smooth_joins(self) -> bool {
@@ -110,7 +127,7 @@ fn unit_path(kind: ShapeKind) -> Option<Path> {
     let arrow: [(f32, f32); 7] =
         [(0.0, 0.25), (0.5, 0.25), (0.5, 0.0), (1.0, 0.5), (0.5, 1.0), (0.5, 0.75), (0.0, 0.75)];
     match kind {
-        ShapeKind::Line => return None,
+        ShapeKind::Line | ShapeKind::Curve | ShapeKind::Polygon => return None,
         ShapeKind::Rect => poly(&mut pb, &[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]),
         ShapeKind::RoundRect | ShapeKind::Ellipse => unreachable!("handled in rect_path"),
         ShapeKind::Triangle => poly(&mut pb, &[(0.5, 0.0), (1.0, 1.0), (0.0, 1.0)]),
@@ -168,7 +185,7 @@ fn rounded_rect(r: Rect, radius: f32) -> Option<Path> {
 
 /// Path for `kind` spanning from `a` to `b` in canvas coordinates.
 pub fn path(kind: ShapeKind, a: Pos2, b: Pos2) -> Option<Path> {
-    if kind.is_line() {
+    if kind.by_points() {
         let mut pb = PathBuilder::new();
         pb.move_to(a.x, a.y);
         pb.line_to(b.x, b.y);
@@ -190,8 +207,93 @@ pub fn path(kind: ShapeKind, a: Pos2, b: Pos2) -> Option<Path> {
     }
 }
 
+/// Cubic curve from `a` to `b` bent by up to two control points.
+pub fn curve_path(a: Pos2, b: Pos2, ctrl: &[Pos2]) -> Option<Path> {
+    let mut pb = PathBuilder::new();
+    pb.move_to(a.x, a.y);
+    match ctrl {
+        [c1, c2, ..] => pb.cubic_to(c1.x, c1.y, c2.x, c2.y, b.x, b.y),
+        [c] => pb.quad_to(c.x, c.y, b.x, b.y),
+        [] => pb.line_to(b.x, b.y),
+    }
+    pb.finish()
+}
+
+pub fn polygon_path(pts: &[Pos2], closed: bool) -> Option<Path> {
+    let mut pb = PathBuilder::new();
+    pb.move_to(pts.first()?.x, pts[0].y);
+    for p in &pts[1..] {
+        pb.line_to(p.x, p.y);
+    }
+    if closed {
+        pb.close();
+    }
+    pb.finish()
+}
+
+/// How a shape's outline or fill is painted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PaintStyle {
+    None,
+    Solid,
+    Crayon,
+    Marker,
+    Oil,
+    NaturalPencil,
+    Watercolor,
+}
+
+impl PaintStyle {
+    pub const ALL: [PaintStyle; 7] = [
+        PaintStyle::None,
+        PaintStyle::Solid,
+        PaintStyle::Crayon,
+        PaintStyle::Marker,
+        PaintStyle::Oil,
+        PaintStyle::NaturalPencil,
+        PaintStyle::Watercolor,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            PaintStyle::None => "None",
+            PaintStyle::Solid => "Solid color",
+            PaintStyle::Crayon => "Crayon",
+            PaintStyle::Marker => "Marker",
+            PaintStyle::Oil => "Oil",
+            PaintStyle::NaturalPencil => "Natural pencil",
+            PaintStyle::Watercolor => "Watercolor",
+        }
+    }
+
+    /// The brush whose texture this style borrows, for textured styles.
+    pub fn brush(self) -> Option<crate::brushes::BrushKind> {
+        use crate::brushes::BrushKind as B;
+        match self {
+            PaintStyle::None | PaintStyle::Solid => None,
+            PaintStyle::Crayon => Some(B::Crayon),
+            PaintStyle::Marker => Some(B::Marker),
+            PaintStyle::Oil => Some(B::Oil),
+            PaintStyle::NaturalPencil => Some(B::NaturalPencil),
+            PaintStyle::Watercolor => Some(B::Watercolor),
+        }
+    }
+}
+
 /// Flattened polylines of a shape inside `rect`, for drawing ribbon icons with egui.
 pub fn icon_polylines(kind: ShapeKind, rect: Rect) -> Vec<Vec<Pos2>> {
+    let at = |x: f32, y: f32| pos2(rect.min.x + x * rect.width(), rect.min.y + y * rect.height());
+    match kind {
+        ShapeKind::Curve => {
+            let p = curve_path(at(0.0, 0.85), at(1.0, 0.15), &[at(0.15, -0.3), at(0.85, 1.3)]);
+            return p.map(|p| flatten(&p)).unwrap_or_default();
+        }
+        ShapeKind::Polygon => {
+            let pts = [at(0.1, 0.3), at(0.55, 0.0), at(1.0, 0.45), at(0.7, 1.0), at(0.15, 0.85)];
+            return polygon_path(&pts, true).map(|p| flatten(&p)).unwrap_or_default();
+        }
+        _ => {}
+    }
     let (a, b) = if kind.is_line() {
         (rect.left_bottom(), rect.right_top())
     } else {
@@ -260,7 +362,7 @@ pub fn flatten(p: &Path) -> Vec<Vec<Pos2>> {
 /// Shift-constrain: squares for shapes, 45° steps for lines.
 pub fn constrain(kind: ShapeKind, a: Pos2, b: Pos2) -> Pos2 {
     let d = b - a;
-    if kind.is_line() {
+    if kind.by_points() {
         let ang = d.y.atan2(d.x);
         let step = std::f32::consts::FRAC_PI_4;
         let snapped = (ang / step).round() * step;

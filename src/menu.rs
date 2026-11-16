@@ -30,10 +30,15 @@ pub enum Action {
     FlipHorizontal,
     FlipVertical,
     ImageProperties,
+    ToggleLayers,
+    ThemeSystem,
+    ThemeLight,
+    ThemeDark,
+    Settings,
 }
 
 impl Action {
-    const ALL: [Action; 24] = [
+    pub const ALL: [Action; 29] = [
         Action::New,
         Action::Open,
         Action::Save,
@@ -58,10 +63,15 @@ impl Action {
         Action::FlipHorizontal,
         Action::FlipVertical,
         Action::ImageProperties,
+        Action::ToggleLayers,
+        Action::ThemeSystem,
+        Action::ThemeLight,
+        Action::ThemeDark,
+        Action::Settings,
     ];
 
     fn id(self) -> String {
-        format!("daub.{self:?}")
+        format!("dabble.{self:?}")
     }
 
     pub fn label(self) -> &'static str {
@@ -70,7 +80,7 @@ impl Action {
             Action::Open => "Open…",
             Action::Save => "Save",
             Action::SaveAs => "Save As…",
-            Action::Quit => "Quit Daub",
+            Action::Quit => "Quit Dabble",
             Action::Undo => "Undo",
             Action::Redo => "Redo",
             Action::Cut => "Cut",
@@ -90,6 +100,11 @@ impl Action {
             Action::FlipHorizontal => "Flip Horizontal",
             Action::FlipVertical => "Flip Vertical",
             Action::ImageProperties => "Image Properties…",
+            Action::ToggleLayers => "Layers",
+            Action::ThemeSystem => "Match System Appearance",
+            Action::ThemeLight => "Light Appearance",
+            Action::ThemeDark => "Dark Appearance",
+            Action::Settings => "Settings…",
         }
     }
 
@@ -115,6 +130,9 @@ impl Action {
             Action::RotateRight => "CmdOrCtrl+R",
             Action::RotateLeft => "CmdOrCtrl+L",
             Action::ImageProperties => "CmdOrCtrl+E",
+            Action::ToggleLayers => "CmdOrCtrl+Shift+L",
+            Action::Settings => "CmdOrCtrl+Comma",
+            Action::ThemeSystem | Action::ThemeLight | Action::ThemeDark => return None,
             Action::Delete | Action::Rotate180 | Action::FlipHorizontal | Action::FlipVertical => return None,
         })
     }
@@ -128,6 +146,7 @@ impl Action {
                     .replace("Alt+", "⌥")
                     .replace("Equal", "=")
                     .replace("Minus", "-")
+                    .replace("Comma", ",")
             })
             .unwrap_or_default()
     }
@@ -149,9 +168,11 @@ impl NativeMenu {
             MenuItem::with_id(a.id(), a.label(), true, acc)
         };
         let menu = Menu::new();
-        let app = Submenu::new("Daub", true);
+        let app = Submenu::new("Dabble", true);
         app.append_items(&[
-            &P::about(Some("About Daub"), None),
+            &P::about(Some("About Dabble"), None),
+            &P::separator(),
+            &item(Action::Settings),
             &P::separator(),
             &P::services(None),
             &P::separator(),
@@ -190,6 +211,12 @@ impl NativeMenu {
             &item(Action::ZoomOut),
             &item(Action::ZoomActual),
             &item(Action::ZoomFit),
+            &P::separator(),
+            &item(Action::ToggleLayers),
+            &P::separator(),
+            &item(Action::ThemeSystem),
+            &item(Action::ThemeLight),
+            &item(Action::ThemeDark),
             &P::separator(),
             &P::fullscreen(None),
         ])
@@ -249,6 +276,7 @@ pub fn egui_shortcuts(ctx: &egui::Context) -> Vec<Action> {
     let table = [
         (K::new(M::COMMAND | M::SHIFT, Key::S), Action::SaveAs),
         (K::new(M::COMMAND | M::SHIFT, Key::Z), Action::Redo),
+        (K::new(M::COMMAND | M::SHIFT, Key::L), Action::ToggleLayers),
         (K::new(M::COMMAND, Key::N), Action::New),
         (K::new(M::COMMAND, Key::O), Action::Open),
         (K::new(M::COMMAND, Key::S), Action::Save),
@@ -260,6 +288,7 @@ pub fn egui_shortcuts(ctx: &egui::Context) -> Vec<Action> {
         (K::new(M::COMMAND, Key::Minus), Action::ZoomOut),
         (K::new(M::COMMAND, Key::Num0), Action::ZoomActual),
         (K::new(M::COMMAND, Key::Num9), Action::ZoomFit),
+        (K::new(M::COMMAND, Key::Comma), Action::Settings),
         (K::new(M::COMMAND | M::ALT, Key::I), Action::ResizeSkew),
         (K::new(M::COMMAND, Key::K), Action::Crop),
         (K::new(M::COMMAND, Key::R), Action::RotateRight),

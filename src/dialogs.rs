@@ -3,13 +3,14 @@
 use egui::{RichText, Ui};
 use egui_phosphor::regular as ic;
 
-use crate::app::DaubApp;
+use crate::app::DabbleApp;
 use crate::raster::MAX_DIM;
 use crate::theme;
 
 pub enum Dialog {
     Resize(ResizeDialog),
     Properties(PropertiesDialog),
+    Settings(crate::settings::Settings),
 }
 
 pub struct ResizeDialog {
@@ -101,7 +102,7 @@ fn buttons(ui: &mut Ui) -> Outcome {
         if ui.button("  Cancel  ").clicked() {
             out = Outcome::Cancel;
         }
-        let ok = egui::Button::new(RichText::new("  OK  ").color(egui::Color32::WHITE)).fill(theme::ACCENT);
+        let ok = egui::Button::new(RichText::new("  OK  ").color(theme::on_accent())).fill(theme::accent());
         if ui.add(ok).clicked() || ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             out = Outcome::Ok;
         }
@@ -109,7 +110,7 @@ fn buttons(ui: &mut Ui) -> Outcome {
     out
 }
 
-impl DaubApp {
+impl DabbleApp {
     pub fn open_resize_dialog(&mut self) {
         // A shape or text box is baked in first; a selection stays as the target.
         if self.pending_selection().is_none() {
@@ -134,15 +135,16 @@ impl DaubApp {
     pub fn dialog_ui(&mut self, ctx: &egui::Context) {
         let Some(dialog) = &mut self.dialog else { return };
         let mut outcome = Outcome::Open;
-        let modal = egui::Modal::new(egui::Id::new("daub-dialog")).show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::new("dabble-dialog")).show(ctx, |ui| {
             ui.set_width(300.0);
             // Give number fields a visible box so they read as editable.
             let w = &mut ui.visuals_mut().widgets.inactive;
-            w.bg_stroke = egui::Stroke::new(1.0, theme::DIVIDER);
-            w.bg_fill = egui::Color32::WHITE;
+            w.bg_stroke = egui::Stroke::new(1.0, theme::divider());
+            w.bg_fill = theme::surface();
             match dialog {
                 Dialog::Resize(d) => outcome = resize_ui(ui, d),
                 Dialog::Properties(d) => outcome = properties_ui(ui, d),
+                Dialog::Settings(d) => outcome = settings_ui(ui, d),
             }
         });
         if modal.should_close() && matches!(outcome, Outcome::Open) {
@@ -162,6 +164,7 @@ impl DaubApp {
                     self.transparent_bg = d.transparent;
                     self.set_canvas_size(d.w, d.h);
                 }
+                Some(Dialog::Settings(s)) => self.apply_settings(ctx, s),
                 None => {}
             },
         }
@@ -173,7 +176,7 @@ fn resize_ui(ui: &mut Ui, d: &mut ResizeDialog) -> Outcome {
     ui.label(
         RichText::new(if d.on_selection { "Applies to the selection" } else { "Applies to the whole image" })
             .size(12.0)
-            .color(theme::SUBTLE_TEXT),
+            .color(theme::subtle_text()),
     );
     ui.add_space(8.0);
     ui.label(RichText::new("Resize").strong());
@@ -204,7 +207,7 @@ fn resize_ui(ui: &mut Ui, d: &mut ResizeDialog) -> Outcome {
     ui.label(
         RichText::new(format!("{} × {}px  {}  {tw} × {th}px", d.orig.0, d.orig.1, ic::ARROW_RIGHT))
             .size(12.0)
-            .color(theme::SUBTLE_TEXT),
+            .color(theme::subtle_text()),
     );
     ui.add_space(8.0);
     ui.label(RichText::new("Skew (degrees)").strong());
@@ -216,6 +219,30 @@ fn resize_ui(ui: &mut Ui, d: &mut ResizeDialog) -> Outcome {
         ui.add(egui::DragValue::new(&mut d.skew_v).range(-89.0..=89.0).suffix("°").max_decimals(0));
         ui.end_row();
     });
+    buttons(ui)
+}
+
+fn settings_ui(ui: &mut Ui, s: &mut crate::settings::Settings) -> Outcome {
+    use crate::settings::Interface;
+    use crate::theme::ThemePref;
+    heading(ui, ic::GEAR, "Settings");
+    ui.label(RichText::new("Interface").strong());
+    ui.radio_value(&mut s.interface, Interface::Classic, "Classic: Paint-style ribbon");
+    ui.add_enabled_ui(crate::settings::native_available(), |ui| {
+        ui.radio_value(&mut s.interface, Interface::Native, "macOS: native toolbar and Liquid Glass inspector");
+    });
+    ui.add_space(8.0);
+    ui.label(RichText::new("Appearance").strong());
+    ui.horizontal(|ui| {
+        ui.radio_value(&mut s.theme, ThemePref::System, "Match system");
+        ui.radio_value(&mut s.theme, ThemePref::Light, "Light");
+        ui.radio_value(&mut s.theme, ThemePref::Dark, "Dark");
+    });
+    ui.label(
+        RichText::new("Settings are saved and used the next time Dabble starts.")
+            .size(12.0)
+            .color(theme::subtle_text()),
+    );
     buttons(ui)
 }
 
@@ -235,7 +262,7 @@ fn properties_ui(ui: &mut Ui, d: &mut PropertiesDialog) -> Outcome {
     ui.label(
         RichText::new("Changing the size crops or extends the canvas from the bottom-right.")
             .size(12.0)
-            .color(theme::SUBTLE_TEXT),
+            .color(theme::subtle_text()),
     );
     buttons(ui)
 }

@@ -3,7 +3,7 @@
 
 use egui::{Color32, Event, Key, Modifiers, PointerButton, Pos2, RawInput, Rect, pos2, vec2};
 
-use crate::app::{DaubApp, PendingKind, SelectMode, Tool};
+use crate::app::{DabbleApp, PendingKind, SelectMode, Tool};
 use crate::dialogs::Dialog;
 use crate::menu::Action;
 use crate::raster;
@@ -11,7 +11,7 @@ use crate::shapes::ShapeKind;
 
 struct H {
     ctx: egui::Context,
-    app: DaubApp,
+    app: DabbleApp,
     t: f64,
     mods: Modifiers,
 }
@@ -21,7 +21,7 @@ const RED: Color32 = Color32::from_rgb(220, 20, 30);
 impl H {
     fn new() -> Self {
         let ctx = egui::Context::default();
-        let mut app = DaubApp::create(&ctx, None, false);
+        let mut app = DabbleApp::create(&ctx, None, false);
         app.clipboard = None; // never touch the real clipboard from tests
         let mut h = H { ctx, app, t: 0.0, mods: Modifiers::NONE };
         h.app.replace_doc(raster::new_canvas(200, 150, Color32::WHITE), None);
@@ -241,7 +241,7 @@ fn shape_stays_editable_then_commits() {
     assert_eq!(h.px(120, 70), Color32::BLACK, "right edge moved");
     assert_eq!(h.px(80, 40), Color32::WHITE, "old right edge gone");
     // Colors and fill update the pending shape live.
-    h.app.shape_fill = true;
+    h.app.shape_fill = crate::shapes::PaintStyle::Solid;
     h.app.secondary = RED;
     h.frame(vec![]);
     // style changes are picked up by the ribbon diff; force it like the ribbon does
@@ -500,20 +500,239 @@ fn properties_dialog_sets_size_and_transparency() {
     assert_eq!(h.px(10, 10), Color32::TRANSPARENT);
 }
 
+#[test]
+fn layers_paint_separately_and_undo_structure() {
+    let mut h = H::new();
+    h.app.add_layer();
+    assert_eq!((h.app.layers.len(), h.app.active), (2, 1));
+    assert_eq!(h.px(5, 5), Color32::TRANSPARENT, "new layer is empty");
+    h.app.primary = RED;
+    h.app.set_tool(Tool::Pencil);
+    h.drag((10.5, 10.5), (40.5, 10.5), L);
+    assert_eq!(h.px(20, 10), RED);
+    // The background layer is untouched; the flattened image shows both.
+    h.app.select_layer(0);
+    assert_eq!(h.px(20, 10), Color32::WHITE);
+    assert_eq!(raster::pixel(&h.app.flatten(), 20, 10), Some(RED));
+    // Hide the top layer: it drops out of the flattened image.
+    h.app.layers[1].visible = false;
+    assert_eq!(raster::pixel(&h.app.flatten(), 20, 10), Some(Color32::WHITE));
+    h.app.layers[1].visible = true;
+    // Eraser on an upper layer leaves transparent pixels.
+    h.app.select_layer(1);
+    h.app.set_tool(Tool::Eraser);
+    h.click(20.5, 10.5, L);
+    assert_eq!(h.px(20, 10), Color32::TRANSPARENT);
+    // Undo: eraser, pencil, then the new layer itself.
+    h.key(Key::Z, Modifiers::COMMAND);
+    assert_eq!(h.px(20, 10), RED);
+    h.key(Key::Z, Modifiers::COMMAND);
+    h.key(Key::Z, Modifiers::COMMAND);
+    assert_eq!(h.app.layers.len(), 1);
+    assert!(!h.app.is_dirty());
+    h.key(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT);
+    h.key(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT);
+    assert_eq!((h.app.layers.len(), h.app.active), (2, 1));
+    assert_eq!(h.px(20, 10), RED);
+}
+
+#[test]
+fn merge_move_duplicate_delete_layers() {
+    let mut h = H::new();
+    h.app.add_layer();
+    raster::set_px(&mut h.app.doc, 3, 3, raster::premul(RED));
+    h.app.layers[1].opacity = 1.0;
+    h.app.duplicate_layer();
+    assert_eq!(h.app.layers.len(), 3);
+    assert_eq!(h.app.layers[2].name, "Layer 1 copy");
+    h.app.move_layer(-1);
+    assert_eq!(h.app.active, 1);
+    assert_eq!(h.app.layers[2].name, "Layer 1");
+    h.app.delete_layer();
+    assert_eq!(h.app.layers.len(), 2);
+    h.app.select_layer(1);
+    h.app.merge_down();
+    assert_eq!((h.app.layers.len(), h.app.active), (1, 0));
+    assert_eq!(h.px(3, 3), RED);
+    h.key(Key::Z, Modifiers::COMMAND);
+    assert_eq!(h.app.layers.len(), 2);
+    assert_eq!(h.app.active, 1);
+    assert_eq!(h.px(3, 3), RED);
+    h.app.select_layer(0);
+    assert_eq!(h.px(3, 3), Color32::WHITE, "merge undone on the lower layer");
+}
+
+#[test]
+fn whole_image_ops_apply_to_every_layer() {
+    let mut h = H::new();
+    h.app.add_layer();
+    raster::set_px(&mut h.app.doc, 0, 0, raster::premul(RED));
+    act(&mut h, Action::RotateRight);
+    assert_eq!(h.px(149, 0), RED);
+    h.app.select_layer(0);
+    assert_eq!((h.app.doc.width(), h.app.doc.height()), (150, 200));
+    h.app.set_canvas_size(300, 300);
+    assert_eq!(h.px(250, 250), Color32::WHITE, "background grows white");
+    h.app.select_layer(1);
+    assert_eq!(h.px(250, 250), Color32::TRANSPARENT, "upper layers grow transparent");
+}
+
+#[test]
+fn every_brush_kind_paints_through_the_ui() {
+    for k in crate::brushes::BrushKind::ALL {
+        let mut h = H::new();
+        h.app.brush_kind = k;
+        h.app.sizes.brush = 10.0;
+        h.app.set_tool(Tool::Brush);
+        h.drag((20.0, 50.0), (150.0, 60.0), L);
+        let dark = (0..200).flat_map(|x| (30..80).map(move |y| (x, y))).filter(|&(x, y)| h.px(x, y).r() < 200).count();
+        assert!(dark > 50, "{k:?}: {dark}");
+        assert!(h.app.history.can_undo(), "{k:?} recorded");
+        h.key(Key::Z, Modifiers::COMMAND);
+        assert!(!h.app.is_dirty(), "{k:?} undone");
+    }
+}
+
+#[test]
+fn curve_bends_twice_then_commits() {
+    let mut h = H::new();
+    h.app.shape_kind = ShapeKind::Curve;
+    h.app.sizes.shape = 2.0;
+    h.app.set_tool(Tool::Shape);
+    h.drag((20.0, 100.0), (180.0, 100.0), L);
+    assert_eq!(h.px(100, 100), Color32::BLACK, "straight at first");
+    h.drag((100.0, 40.0), (100.0, 20.0), L);
+    assert_eq!(h.px(100, 100), Color32::WHITE, "bent away");
+    let Some(PendingKind::Shape(s)) = h.app.pending.as_ref().map(|p| &p.kind) else { panic!() };
+    assert_eq!((s.stage, s.pts.len()), (2, 2));
+    h.drag((150.0, 140.0), (150.0, 140.0), L);
+    let Some(PendingKind::Shape(s)) = h.app.pending.as_ref().map(|p| &p.kind) else { panic!() };
+    assert_eq!(s.stage, 3);
+    h.key(Key::Enter, Modifiers::NONE);
+    assert!(h.app.pending.is_none());
+    let dark = h.app.doc.pixels().iter().filter(|p| p.red() < 128).count();
+    assert!(dark > 150, "{dark}");
+}
+
+#[test]
+fn polygon_adds_corners_and_closes_with_fill() {
+    let mut h = H::new();
+    h.app.shape_kind = ShapeKind::Polygon;
+    h.app.shape_fill = crate::shapes::PaintStyle::Solid;
+    h.app.secondary = RED;
+    h.app.set_tool(Tool::Shape);
+    h.drag((20.0, 20.0), (120.0, 20.0), L);
+    h.click(120.0, 120.0, L);
+    h.click(20.0, 120.0, L);
+    assert_eq!(h.px(70, 70), Color32::WHITE, "open: no fill yet");
+    h.click(20.5, 20.5, L); // back on the first corner closes it
+    let Some(PendingKind::Shape(s)) = h.app.pending.as_ref().map(|p| &p.kind) else { panic!() };
+    assert_eq!((s.stage, s.pts.len()), (2, 4));
+    assert_eq!(h.px(70, 70), RED, "closed: filled");
+    assert_eq!(h.px(20, 70), Color32::BLACK, "closing edge drawn");
+    h.key(Key::Enter, Modifiers::NONE);
+    assert!(h.app.pending.is_none());
+}
+
+#[test]
+fn polygon_closes_on_commit() {
+    let mut h = H::new();
+    h.app.shape_kind = ShapeKind::Polygon;
+    h.app.set_tool(Tool::Shape);
+    h.drag((20.0, 20.0), (120.0, 20.0), L);
+    h.click(120.0, 120.0, L);
+    assert_eq!(h.px(70, 70), Color32::WHITE);
+    h.key(Key::Escape, Modifiers::NONE);
+    // The closing edge (120,120)→(20,20) passes through (70,70).
+    assert_eq!(h.px(70, 70), Color32::BLACK);
+}
+
+#[test]
+fn textured_shape_styles() {
+    use crate::shapes::PaintStyle;
+    for st in [PaintStyle::Crayon, PaintStyle::Marker, PaintStyle::Oil, PaintStyle::NaturalPencil, PaintStyle::Watercolor] {
+        let mut h = H::new();
+        h.app.shape_kind = ShapeKind::Rect;
+        h.app.shape_outline = PaintStyle::None;
+        h.app.shape_fill = st;
+        h.app.secondary = Color32::BLACK;
+        h.app.set_tool(Tool::Shape);
+        h.drag((20.0, 20.0), (120.0, 100.0), L);
+        let painted: Vec<u8> = (30..110).map(|x| h.px(x, 60).r()).collect();
+        let covered = painted.iter().filter(|r| **r < 255).count();
+        assert!(covered * 10 >= painted.len() * 8, "{st:?} covers the fill: {covered}/{}", painted.len());
+        if st != PaintStyle::Marker {
+            assert!(painted.iter().min() != painted.iter().max(), "{st:?} is textured");
+        }
+        assert_eq!(h.px(10, 10), Color32::WHITE);
+    }
+}
+
+#[test]
+fn theme_follows_setting() {
+    let mut h = H::new();
+    act(&mut h, Action::ThemeDark);
+    h.frame(vec![]);
+    assert!(h.app.dark);
+    act(&mut h, Action::ThemeLight);
+    h.frame(vec![]);
+    assert!(!h.app.dark);
+}
+
+#[test]
+fn native_events_drive_the_app() {
+    use crate::mac_ui::{LayerCmd, NativeEvent as E};
+    let mut h = H::new();
+    let ctx = h.ctx.clone();
+    h.app.apply_native_event(E::Brush(crate::brushes::BrushKind::Oil), &ctx);
+    assert_eq!((h.app.tool, h.app.brush_kind), (Tool::Brush, crate::brushes::BrushKind::Oil));
+    h.app.apply_native_event(E::Size(17.0), &ctx);
+    assert_eq!(h.app.sizes.brush, 17.0);
+    h.app.apply_native_event(E::Palette(RED, false), &ctx);
+    h.app.apply_native_event(E::Palette(Color32::BLACK, true), &ctx);
+    assert_eq!((h.app.primary, h.app.secondary), (RED, Color32::BLACK));
+    h.app.apply_native_event(E::Layer(LayerCmd::Add), &ctx);
+    h.app.apply_native_event(E::Layer(LayerCmd::Opacity(0.5)), &ctx);
+    assert_eq!((h.app.layers.len(), h.app.layers[1].opacity), (2, 0.5));
+    h.app.apply_native_event(E::Layer(LayerCmd::Select(0)), &ctx);
+    assert_eq!(h.app.active, 0);
+    h.app.apply_native_event(E::Action(Action::RotateRight), &ctx);
+    assert_eq!((h.app.doc.width(), h.app.doc.height()), (150, 200));
+    h.app.apply_native_event(E::Tool(Tool::Shape), &ctx);
+    h.app.apply_native_event(E::Shape(ShapeKind::Heart), &ctx);
+    assert_eq!(h.app.shape_kind, ShapeKind::Heart);
+}
+
+#[test]
+fn settings_dialog_applies_theme_without_native_window() {
+    let mut h = H::new();
+    act(&mut h, Action::Settings);
+    let Some(Dialog::Settings(s)) = &mut h.app.dialog else { panic!("settings open") };
+    s.theme = crate::theme::ThemePref::Dark;
+    // Test apps have no macOS window, so the native interface can't turn on;
+    // apply only the theme here (the dialog's OK would also save the file).
+    let s = s.clone();
+    h.app.dialog = None;
+    h.app.theme_pref = s.theme;
+    h.frame(vec![]);
+    assert!(h.app.dark);
+    assert!(h.app.native.is_none());
+}
+
 /// Renders the real UI offscreen to PNG files (for eyeballing the layout):
-/// `DAUB_SHOT_DIR=/some/dir cargo test render_screenshots -- --ignored`
+/// `DABBLE_SHOT_DIR=/some/dir cargo test render_screenshots -- --ignored`
 #[test]
 #[ignore]
 fn render_screenshots() {
     use egui_kittest::Harness;
-    let dir = std::path::PathBuf::from(std::env::var("DAUB_SHOT_DIR").expect("DAUB_SHOT_DIR"));
+    let dir = std::path::PathBuf::from(std::env::var("DABBLE_SHOT_DIR").expect("DABBLE_SHOT_DIR"));
     let mut harness = Harness::builder()
         .with_size(vec2(1280.0, 840.0))
         .with_pixels_per_point(1.0)
         .build_ui_state(
-            |ui, app: &mut Option<DaubApp>| {
+            |ui, app: &mut Option<DabbleApp>| {
                 let a = app.get_or_insert_with(|| {
-                    let mut a = DaubApp::create(ui.ctx(), None, false);
+                    let mut a = DabbleApp::create(ui.ctx(), None, false);
                     a.clipboard = None;
                     a
                 });
@@ -535,22 +754,22 @@ fn render_screenshots() {
         }
         let stroke = tiny_skia::Stroke { width: 8.0, line_cap: tiny_skia::LineCap::Round, line_join: tiny_skia::LineJoin::Round, ..Default::default() };
         a.doc.stroke_path(&pb.finish().unwrap(), &raster::paint(a.primary, true), &stroke, tiny_skia::Transform::identity(), None);
-        a.history.record(&before, &a.doc);
+        a.history.record(0, &before, &a.doc);
         a.shape_kind = ShapeKind::Star5;
-        a.shape_fill = true;
+        a.shape_fill = crate::shapes::PaintStyle::Solid;
         a.secondary = Color32::from_rgb(0xfd, 0xd8, 0x35);
         a.primary = Color32::BLACK;
         a.sizes.shape = 3.0;
         a.set_tool(Tool::Shape);
         a.pending = Some(crate::app::Pending {
             base: a.doc.clone(),
-            kind: PendingKind::Shape(crate::app::ShapeState { kind: ShapeKind::Star5, a: pos2(650.5, 120.5), b: pos2(850.5, 310.5), swap: false }),
+            kind: PendingKind::Shape(crate::app::ShapeState { b: pos2(850.5, 310.5), ..crate::app::ShapeState::new(ShapeKind::Star5, pos2(650.5, 120.5), false) }),
         });
         a.rerender_pending();
         a.mark_changed();
     }
     harness.run();
-    harness.render().unwrap().save(dir.join("daub-shapes.png")).unwrap();
+    harness.render().unwrap().save(dir.join("dabble-shapes.png")).unwrap();
 
     {
         let a = harness.state_mut().as_mut().unwrap();
@@ -562,7 +781,7 @@ fn render_screenshots() {
             base: a.doc.clone(),
             kind: PendingKind::Text(crate::app::TextState {
                 rect: Rect::from_min_size(pos2(120.0, 420.0), vec2(420.0, 40.0)),
-                text: "Hello from Daub".chars().collect(),
+                text: "Hello from Dabble".chars().collect(),
                 caret: 15,
             }),
         });
@@ -571,7 +790,7 @@ fn render_screenshots() {
     for _ in 0..5 {
         harness.step();
     }
-    harness.render().unwrap().save(dir.join("daub-text.png")).unwrap();
+    harness.render().unwrap().save(dir.join("dabble-text.png")).unwrap();
 
     // Rotated, scaled selection with handles.
     {
@@ -595,7 +814,7 @@ fn render_screenshots() {
     for _ in 0..3 {
         harness.step();
     }
-    harness.render().unwrap().save(dir.join("daub-selection.png")).unwrap();
+    harness.render().unwrap().save(dir.join("dabble-selection.png")).unwrap();
 
     {
         let a = harness.state_mut().as_mut().unwrap();
@@ -604,5 +823,56 @@ fn render_screenshots() {
     for _ in 0..5 {
         harness.step();
     }
-    harness.render().unwrap().save(dir.join("daub-resize.png")).unwrap();
+    harness.render().unwrap().save(dir.join("dabble-resize.png")).unwrap();
+
+    // Every brush, a textured polygon on its own layer, and the layers panel.
+    {
+        let a = harness.state_mut().as_mut().unwrap();
+        a.dialog = None;
+        a.commit_pending();
+        a.replace_doc(raster::new_canvas(1152, 648, Color32::WHITE), None);
+        let colors = [0x1e88e5u32, 0xe53935, 0x43a047, 0x8e24aa, 0xfb8c00, 0x00acc1, 0xfdd835, 0x595959, 0x1e88e5];
+        for (i, k) in crate::brushes::BrushKind::ALL.into_iter().enumerate() {
+            let c = colors[i];
+            let color = Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8);
+            let mut st = crate::brushes::Stroke::new(k, color, 14.0, a.doc.clone());
+            let y0 = 50.0 + i as f32 * 62.0;
+            for j in 0..=80 {
+                let t = j as f32 / 80.0;
+                st.add_point(&mut a.doc, pos2(60.0 + t * 420.0, y0 + (t * 9.0).sin() * 16.0));
+            }
+            st.tick(&mut a.doc, 0.1);
+        }
+        a.add_layer();
+        a.shape_kind = ShapeKind::Polygon;
+        a.shape_fill = crate::shapes::PaintStyle::Watercolor;
+        a.shape_outline = crate::shapes::PaintStyle::Crayon;
+        a.sizes.shape = 8.0;
+        a.secondary = Color32::from_rgb(0x90, 0xca, 0xf9);
+        a.primary = Color32::from_rgb(0x8e, 0x24, 0xaa);
+        let mut s = crate::app::ShapeState::new(ShapeKind::Polygon, pos2(600.0, 120.0), false);
+        s.pts = vec![pos2(620.0, 110.0), pos2(1000.0, 160.0), pos2(940.0, 520.0), pos2(700.0, 440.0), pos2(580.0, 300.0)];
+        s.stage = 2;
+        a.pending = Some(crate::app::Pending { base: a.doc.clone(), kind: PendingKind::Shape(s) });
+        a.rerender_pending();
+        a.commit_pending();
+        a.add_layer();
+        a.layers[1].opacity = 0.8;
+        a.show_layers = true;
+        a.set_tool(Tool::Brush);
+        a.brush_kind = crate::brushes::BrushKind::Watercolor;
+    }
+    for _ in 0..5 {
+        harness.step();
+    }
+    harness.render().unwrap().save(dir.join("dabble-layers.png")).unwrap();
+    {
+        let a = harness.state_mut().as_mut().unwrap();
+        a.theme_pref = crate::theme::ThemePref::Dark;
+        a.brush_previews = None;
+    }
+    for _ in 0..5 {
+        harness.step();
+    }
+    harness.render().unwrap().save(dir.join("dabble-dark.png")).unwrap();
 }

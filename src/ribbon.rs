@@ -3,12 +3,12 @@
 use egui::{Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Shape, Stroke, StrokeKind, Ui, vec2};
 use egui_phosphor::regular as ic;
 
-use crate::app::{DaubApp, Pending, PendingKind, SelectMode, Tool};
+use crate::app::{DabbleApp, Pending, PendingKind, SelectMode, Tool};
 use crate::menu::Action;
 use crate::shapes::{self, ShapeKind};
 use crate::theme;
 
-const PALETTE: [[u8; 3]; 20] = [
+pub const PALETTE: [[u8; 3]; 20] = [
     [0x00, 0x00, 0x00],
     [0x59, 0x59, 0x59],
     [0x9b, 0x1c, 0x1c],
@@ -39,35 +39,43 @@ const ROTATE_ACTIONS: [Action; 5] = [
     Action::FlipHorizontal,
 ];
 
-const FONT_SIZES: [f32; 16] = [8., 9., 10., 11., 12., 14., 16., 18., 20., 22., 24., 28., 36., 48., 72., 96.];
+pub const FONT_SIZES: [f32; 16] = [8., 9., 10., 11., 12., 14., 16., 18., 20., 22., 24., 28., 36., 48., 72., 96.];
 
 #[derive(PartialEq)]
-struct StyleSig {
+pub struct StyleSig {
     primary: Color32,
     secondary: Color32,
     shape_size: f32,
-    outline: bool,
-    fill: bool,
+    outline: crate::shapes::PaintStyle,
+    fill: crate::shapes::PaintStyle,
     text: crate::text::TextStyle,
+}
+
+/// Background for a toolbar button: fades in on hover, darker while pressed.
+fn button_bg(ui: &Ui, resp: &egui::Response, selected: bool) -> Color32 {
+    let hover = ui.ctx().animate_bool(resp.id.with("hover"), resp.hovered() && ui.is_enabled());
+    if selected {
+        theme::selected_bg()
+    } else if resp.is_pointer_button_down_on() {
+        theme::pressed_bg()
+    } else {
+        theme::hover_bg().gamma_multiply(hover)
+    }
 }
 
 fn icon_button(ui: &mut Ui, icon: &str, selected: bool, size: f32, tip: &str) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click());
-    let bg = if selected {
-        theme::SELECTED_BG
-    } else if resp.hovered() {
-        theme::HOVER_BG
-    } else {
-        Color32::TRANSPARENT
-    };
+    let bg = button_bg(ui, &resp, selected);
+    // Icons sink a little while pressed.
+    let press = ui.ctx().animate_bool(resp.id.with("press"), resp.is_pointer_button_down_on());
     let p = ui.painter();
-    p.rect_filled(rect, 4.0, bg);
+    p.rect_filled(rect, 6.0, bg);
     if selected {
         let bar = Rect::from_center_size(rect.center_bottom() - vec2(0.0, 1.5), vec2(size * 0.4, 3.0));
-        p.rect_filled(bar, 1.5, theme::ACCENT);
+        p.rect_filled(bar, 1.5, theme::accent());
     }
-    let color = if ui.is_enabled() { theme::TEXT } else { Color32::from_gray(170) };
-    p.text(rect.center(), Align2::CENTER_CENTER, icon, FontId::proportional(size * 0.58), color);
+    let color = if ui.is_enabled() { theme::text() } else { theme::disabled_text() };
+    p.text(rect.center(), Align2::CENTER_CENTER, icon, FontId::proportional(size * (0.58 - 0.04 * press)), color);
     resp.on_hover_text(tip)
 }
 
@@ -78,14 +86,14 @@ fn group(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui)) {
             add(ui);
         });
         let w = r.response.rect.width();
-        ui.add_sized([w, 14.0], egui::Label::new(RichText::new(label).size(11.0).color(theme::SUBTLE_TEXT)));
+        ui.add_sized([w, 14.0], egui::Label::new(RichText::new(label).size(11.0).color(theme::subtle_text())));
     });
 }
 
 fn divider(ui: &mut Ui) {
     ui.add_space(6.0);
     let (r, _) = ui.allocate_exact_size(vec2(1.0, 70.0), Sense::hover());
-    ui.painter().rect_filled(r, 0.0, theme::DIVIDER);
+    ui.painter().rect_filled(r, 0.0, theme::divider());
     ui.add_space(6.0);
 }
 
@@ -94,9 +102,12 @@ fn swatch(ui: &mut Ui, c: Option<Color32>, d: f32, ring: bool, tip: &str) -> egu
     let p = ui.painter();
     let center = rect.center();
     if ring {
-        p.circle_stroke(center, d / 2.0, Stroke::new(2.0, theme::ACCENT));
-    } else if resp.hovered() {
-        p.circle_stroke(center, d / 2.0, Stroke::new(1.0, Color32::from_gray(120)));
+        p.circle_stroke(center, d / 2.0, Stroke::new(2.0, theme::accent()));
+    } else {
+        let hover = ui.ctx().animate_bool(resp.id.with("hover"), resp.hovered());
+        if hover > 0.0 {
+            p.circle_stroke(center, d / 2.0, Stroke::new(1.0, theme::subtle_text().gamma_multiply(hover)));
+        }
     }
     let inner = d / 2.0 - if ring { 4.0 } else { 2.0 };
     match c {
@@ -105,14 +116,14 @@ fn swatch(ui: &mut Ui, c: Option<Color32>, d: f32, ring: bool, tip: &str) -> egu
             p.circle_stroke(center, inner, Stroke::new(1.0, Color32::from_black_alpha(50)));
         }
         None => {
-            p.circle_stroke(center, inner, Stroke::new(1.0, Color32::from_gray(200)));
+            p.circle_stroke(center, inner, Stroke::new(1.0, theme::divider()));
         }
     }
     resp.on_hover_text(tip)
 }
 
-impl DaubApp {
-    fn style_sig(&self) -> StyleSig {
+impl DabbleApp {
+    pub fn style_sig(&self) -> StyleSig {
         StyleSig {
             primary: self.primary,
             secondary: self.secondary,
@@ -146,6 +157,8 @@ impl DaubApp {
                 self.menu_item(ui, Action::Save, true);
                 self.menu_item(ui, Action::SaveAs, true);
                 ui.separator();
+                self.menu_item(ui, Action::Settings, true);
+                ui.separator();
                 self.menu_item(ui, Action::Quit, true);
             });
             ui.menu_button("Edit", |ui| {
@@ -176,6 +189,20 @@ impl DaubApp {
                 self.menu_item(ui, Action::ZoomOut, true);
                 self.menu_item(ui, Action::ZoomActual, true);
                 self.menu_item(ui, Action::ZoomFit, true);
+                ui.separator();
+                self.menu_item(ui, Action::ToggleLayers, true);
+                ui.separator();
+                use crate::theme::ThemePref;
+                for (pref, a) in [
+                    (ThemePref::System, Action::ThemeSystem),
+                    (ThemePref::Light, Action::ThemeLight),
+                    (ThemePref::Dark, Action::ThemeDark),
+                ] {
+                    if ui.radio(self.theme_pref == pref, a.label()).clicked() {
+                        self.theme_pref = pref;
+                        ui.close();
+                    }
+                }
             });
             ui.add_space(8.0);
             if icon_button(ui, ic::FLOPPY_DISK, false, 26.0, "Save (⌘S)").clicked() {
@@ -203,17 +230,19 @@ impl DaubApp {
                 divider(ui);
                 self.tools_group(ui);
                 divider(ui);
-                group(ui, "Brushes", |ui| {
-                    if icon_button(ui, ic::PAINT_BRUSH, self.tool == Tool::Brush, 44.0, "Brush").clicked() {
-                        self.set_tool(Tool::Brush);
-                    }
-                });
+                self.brushes_group(ui);
                 divider(ui);
                 self.shapes_group(ui);
                 divider(ui);
                 self.size_group(ui);
                 divider(ui);
                 self.colors_group(ui);
+                divider(ui);
+                group(ui, "Layers", |ui| {
+                    if icon_button(ui, ic::STACK, self.show_layers, 44.0, "Layers (⇧⌘L)").clicked() {
+                        self.show_layers = !self.show_layers;
+                    }
+                });
             });
         });
 
@@ -257,6 +286,61 @@ impl DaubApp {
                 ui.separator();
                 ui.checkbox(&mut self.transparent_selection, "Transparent selection")
                     .on_hover_text("When moving a selection, Color 2 pixels become see-through");
+            });
+        });
+    }
+
+    fn brushes_group(&mut self, ui: &mut Ui) {
+        use crate::brushes::{self, BrushKind};
+        let dark = theme::is_dark();
+        if self.brush_previews.as_ref().is_none_or(|(d, _)| *d != dark) {
+            let ink = if dark { Color32::from_gray(235) } else { Color32::from_gray(30) };
+            let texs = BrushKind::ALL
+                .iter()
+                .map(|k| {
+                    let pm = brushes::preview(*k, 240, 40, ink);
+                    ui.ctx().load_texture(format!("brush-{k:?}"), crate::raster::to_color_image(&pm), Default::default())
+                })
+                .collect();
+            self.brush_previews = Some((dark, texs));
+        }
+        group(ui, "Brushes", |ui| {
+            let kind = self.brush_kind;
+            if icon_button(ui, kind.icon(), self.tool == Tool::Brush, 44.0, kind.name()).clicked() {
+                self.set_tool(Tool::Brush);
+            }
+            ui.menu_button(ic::CARET_DOWN, |ui| {
+                ui.set_min_width(220.0);
+                let previews = self.brush_previews.as_ref().map(|(_, t)| t.clone()).unwrap_or_default();
+                for (k, tex) in BrushKind::ALL.into_iter().zip(previews) {
+                    let (r, resp) = ui.allocate_exact_size(vec2(220.0, 44.0), Sense::click());
+                    let bg = if k == self.brush_kind {
+                        theme::selected_bg()
+                    } else if resp.hovered() {
+                        theme::hover_bg()
+                    } else {
+                        Color32::TRANSPARENT
+                    };
+                    ui.painter().rect_filled(r, 6.0, bg);
+                    ui.painter().image(
+                        tex.id(),
+                        Rect::from_center_size(r.center() - vec2(0.0, 4.0), vec2(150.0, 25.0)),
+                        Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                    ui.painter().text(
+                        r.center_bottom() - vec2(0.0, 7.0),
+                        Align2::CENTER_CENTER,
+                        k.name(),
+                        FontId::proportional(11.0),
+                        theme::subtle_text(),
+                    );
+                    if resp.clicked() {
+                        self.brush_kind = k;
+                        self.set_tool(Tool::Brush);
+                        ui.close();
+                    }
+                }
             });
         });
     }
@@ -328,32 +412,34 @@ impl DaubApp {
                         self.shape_kind = k;
                         self.set_tool(Tool::Shape);
                     }
-                    if i % 6 == 5 && i + 1 < ShapeKind::ALL.len() {
+                    if i % 7 == 6 && i + 1 < ShapeKind::ALL.len() {
                         ui.end_row();
                     }
                 }
             }));
             ui.vertical(|ui| {
                 ui.add_space(4.0);
-                let label = |on: bool| if on { "Solid" } else { "None" };
-                ui.menu_button(format!("{}  Outline: {}", ic::SQUARE, label(self.shape_outline)), |ui| {
-                    if ui.selectable_label(!self.shape_outline, "No outline").clicked() {
-                        self.shape_outline = false;
-                        ui.close();
-                    }
-                    if ui.selectable_label(self.shape_outline, "Solid color").clicked() {
-                        self.shape_outline = true;
-                        ui.close();
+                use crate::shapes::PaintStyle;
+                ui.menu_button(format!("{}  Outline: {}", ic::SQUARE, self.shape_outline.name()), |ui| {
+                    for st in PaintStyle::ALL {
+                        let label = if st == PaintStyle::None { "No outline" } else { st.name() };
+                        if ui.selectable_label(self.shape_outline == st, label).clicked() {
+                            self.shape_outline = st;
+                            ui.close();
+                        }
                     }
                 });
-                ui.menu_button(format!("{}  Fill: {}", ic::PAINT_BUCKET, label(self.shape_fill)), |ui| {
-                    if ui.selectable_label(!self.shape_fill, "No fill").clicked() {
-                        self.shape_fill = false;
-                        ui.close();
-                    }
-                    if ui.selectable_label(self.shape_fill, "Solid color (Color 2)").clicked() {
-                        self.shape_fill = true;
-                        ui.close();
+                ui.menu_button(format!("{}  Fill: {}", ic::PAINT_BUCKET, self.shape_fill.name()), |ui| {
+                    for st in PaintStyle::ALL {
+                        let label = match st {
+                            PaintStyle::None => "No fill",
+                            PaintStyle::Solid => "Solid color (Color 2)",
+                            _ => st.name(),
+                        };
+                        if ui.selectable_label(self.shape_fill == st, label).clicked() {
+                            self.shape_fill = st;
+                            ui.close();
+                        }
                     }
                 });
             });
@@ -366,9 +452,9 @@ impl DaubApp {
             let enabled = self.size_for_tool().is_some();
             ui.add_enabled_ui(enabled, |ui| {
                 let (rect, resp) = ui.allocate_exact_size(vec2(44.0, 44.0), Sense::click());
-                let bg = if resp.hovered() { theme::HOVER_BG } else { Color32::TRANSPARENT };
+                let bg = if resp.hovered() { theme::hover_bg() } else { Color32::TRANSPARENT };
                 ui.painter().rect_filled(rect, 4.0, bg);
-                let color = if enabled { theme::TEXT } else { Color32::from_gray(170) };
+                let color = if enabled { theme::text() } else { theme::disabled_text() };
                 for (i, t) in [1.0, 2.0, 3.0, 5.0].iter().enumerate() {
                     let y = rect.top() + 11.0 + i as f32 * 7.0;
                     ui.painter().line_segment(
@@ -390,9 +476,9 @@ impl DaubApp {
                         let (r, resp) = ui.allocate_exact_size(vec2(170.0, 22.0), Sense::click());
                         let sel = (*size - p).abs() < 0.01;
                         let bg = if sel {
-                            theme::SELECTED_BG
+                            theme::selected_bg()
                         } else if resp.hovered() {
-                            theme::HOVER_BG
+                            theme::hover_bg()
                         } else {
                             Color32::TRANSPARENT
                         };
@@ -402,11 +488,11 @@ impl DaubApp {
                             Align2::LEFT_CENTER,
                             format!("{p}px"),
                             FontId::proportional(12.0),
-                            theme::SUBTLE_TEXT,
+                            theme::subtle_text(),
                         );
                         ui.painter().line_segment(
                             [r.left_center() + vec2(48.0, 0.0), r.right_center() - vec2(8.0, 0.0)],
-                            Stroke::new(p.min(16.0), theme::TEXT),
+                            Stroke::new(p.min(16.0), theme::text()),
                         );
                         if resp.clicked() {
                             *size = p;
@@ -492,8 +578,8 @@ impl DaubApp {
     fn text_row(&mut self, ui: &mut Ui) {
         self.ensure_fonts();
         let frame = egui::Frame::NONE
-            .fill(Color32::WHITE)
-            .stroke(Stroke::new(1.0, theme::DIVIDER))
+            .fill(theme::surface())
+            .stroke(Stroke::new(1.0, theme::divider()))
             .corner_radius(6.0)
             .inner_margin(egui::Margin::symmetric(8, 4));
         frame.show(ui, |ui| {
@@ -537,7 +623,7 @@ impl DaubApp {
                 ui.label(
                     RichText::new("Click or drag on the canvas to add a text box · Esc to finish")
                         .size(11.0)
-                        .color(theme::SUBTLE_TEXT),
+                        .color(theme::subtle_text()),
                 );
             });
         });
@@ -546,20 +632,14 @@ impl DaubApp {
 
 fn shape_button(ui: &mut Ui, k: ShapeKind, selected: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(24.0, 20.0), Sense::click());
-    let bg = if selected {
-        theme::SELECTED_BG
-    } else if resp.hovered() {
-        theme::HOVER_BG
-    } else {
-        Color32::TRANSPARENT
-    };
+    let bg = button_bg(ui, &resp, selected);
     ui.painter().rect_filled(rect, 3.0, bg);
     if selected {
-        ui.painter().rect_stroke(rect, 3.0, Stroke::new(1.0, theme::ACCENT), StrokeKind::Inside);
+        ui.painter().rect_stroke(rect, 3.0, Stroke::new(1.0, theme::accent()), StrokeKind::Inside);
     }
     let icon_rect = Rect::from_center_size(rect.center(), vec2(14.0, 14.0));
     for line in shapes::icon_polylines(k, icon_rect) {
-        ui.painter().add(Shape::line(line, Stroke::new(1.2, theme::TEXT)));
+        ui.painter().add(Shape::line(line, Stroke::new(1.2, theme::text())));
     }
     resp.on_hover_text(k.name())
 }

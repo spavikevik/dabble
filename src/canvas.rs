@@ -7,8 +7,9 @@ use egui::{
 };
 use tiny_skia::{IntRect, Pixmap};
 
-use crate::app::{DaubApp, Pending, PendingKind, SelectMode, ShapeState, TextState, Tool, ZOOM_STEPS};
+use crate::app::{DabbleApp, Pending, PendingKind, SelectMode, ShapeState, TextState, Tool, ZOOM_STEPS};
 use crate::menu::Action;
+use crate::shapes::ShapeKind;
 use crate::{raster, shapes, theme};
 
 const HANDLE_PX: f32 = 7.0;
@@ -19,11 +20,14 @@ pub enum Op {
     Pan { last: Pos2 },
     Pencil { last: (i32, i32), before: Pixmap, color: Color32 },
     Eraser { last: (i32, i32), before: Pixmap, replace_only: bool },
-    Brush { points: Vec<Pos2>, before: Pixmap, color: Color32 },
+    Brush { stroke: crate::brushes::Stroke },
     ShapeDraw { start: Pos2 },
     ShapeHandle { handle: usize, min0: Pos2, max0: Pos2 },
-    LineEnd { which_b: bool },
-    ShapeMove { grab: Pos2, a0: Pos2, b0: Pos2 },
+    /// Dragging one point of a line, curve or polygon.
+    Vertex { idx: usize },
+    /// Bending a curve: the first bend moves both control points.
+    CurveBend { first: bool },
+    ShapeMove { grab: Pos2, orig: ShapeState },
     SelectRect { start: Pos2, end: Pos2 },
     SelectFree { points: Vec<Pos2> },
     MoveSelection { grab: Pos2, orig: (i32, i32) },
@@ -91,12 +95,15 @@ fn handle_cursor(i: usize) -> CursorIcon {
     }
 }
 
-impl DaubApp {
+impl DabbleApp {
     pub fn canvas_ui(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
         let rect = ui.max_rect();
         let resp = ui.allocate_rect(rect, Sense::click_and_drag());
-        self.view.area = rect;
+        // With the native interface, the toolbar and inspector float over the
+        // canvas: keep the image clear of them.
+        let (top, right) = self.native_insets();
+        self.view.area = Rect::from_min_max(rect.min + vec2(0.0, top), rect.max - vec2(right, 0.0));
         if self.view.fit_next {
             self.fit();
             self.view.fit_next = false;
@@ -121,12 +128,7 @@ impl DaubApp {
         // Upload the document when it changed.
         if self.tex_dirty || self.tex.is_none() {
             let img = raster::to_color_image(&self.doc);
-            let opts = egui::TextureOptions {
-                magnification: egui::TextureFilter::Nearest,
-                minification: egui::TextureFilter::Linear,
-                wrap_mode: egui::TextureWrapMode::ClampToEdge,
-                mipmap_mode: None,
-            };
+            let opts = canvas_texture_options();
             match &mut self.tex {
                 Some(t) => t.set(img, opts),
                 None => self.tex = Some(ctx.load_texture("canvas", img, opts)),
@@ -148,8 +150,16 @@ impl DaubApp {
             Rect::from_min_max(Pos2::ZERO, pos2(crect.width() / 16.0, crect.height() / 16.0)),
             Color32::WHITE,
         );
-        if let Some(t) = &self.tex {
-            painter.image(t.id(), crect, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
+        // Layers bottom to top; the GPU blends them with each layer's opacity.
+        self.sync_layer_textures(&ctx);
+        for (i, l) in self.layers.iter().enumerate() {
+            if !l.visible {
+                continue;
+            }
+            if let Some(t) = self.layer_texture(i) {
+                let tint = Color32::from_white_alpha((l.opacity * 255.0).round() as u8);
+                painter.image(t, crect, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), tint);
+            }
         }
 
         self.draw_overlays(&painter, &ctx);
@@ -286,6 +296,16 @@ impl DaubApp {
                 _ => {}
             }
         }
+        // The airbrush keeps spraying while held still.
+        if gesture.is_some()
+            && let Op::Brush { stroke } = &mut self.op
+            && stroke.kind.continuous()
+        {
+            let dt = ctx.input(|i| i.stable_dt).min(0.1);
+            stroke.tick(&mut self.doc, dt);
+            self.tex_dirty = true;
+            ctx.request_repaint();
+        }
         // Missed release (e.g. focus change): finish the gesture anyway.
         if gesture.is_some() && !any_down {
             if let Some(p) = last_pos {
@@ -335,23 +355,24 @@ impl DaubApp {
                 self.mark_changed();
             }
             Tool::Brush => {
-                let before = self.doc.clone();
-                let points = vec![p];
-                render_brush(&mut self.doc, &before, &points, fg, self.sizes.brush);
-                self.op = Op::Brush { points, before, color: fg };
+                let mut stroke = crate::brushes::Stroke::new(self.brush_kind, fg, self.sizes.brush, self.doc.clone());
+                stroke.add_point(&mut self.doc, p);
+                self.op = Op::Brush { stroke };
                 self.mark_changed();
             }
             Tool::Fill => {
                 let before = self.doc.clone();
                 let (x, y) = px(p);
                 if raster::flood_fill(&mut self.doc, x, y, fg) {
-                    self.history.record(&before, &self.doc);
+                    self.history.record(self.active, &before, &self.doc);
                     self.mark_changed();
                 }
                 return false;
             }
             Tool::Picker => {
-                if let Some(c) = raster::pixel(&self.doc, px(p).0, px(p).1) {
+                // Picks what you see: all visible layers together.
+                let flat = if self.layers.len() > 1 { Some(self.flatten()) } else { None };
+                if let Some(c) = raster::pixel(flat.as_ref().unwrap_or(&self.doc), px(p).0, px(p).1) {
                     let [r, g, b, _] = c.to_srgba_unmultiplied();
                     let c = Color32::from_rgb(r, g, b);
                     if right { self.secondary = c } else { self.primary = c }
@@ -392,13 +413,40 @@ impl DaubApp {
                 };
             }
             Tool::Shape => {
-                if let Some(Pending { kind: PendingKind::Shape(s), .. }) = &self.pending {
-                    if s.kind.is_line() {
-                        for (i, end) in [s.a, s.b].into_iter().enumerate() {
-                            if self.view.to_screen(end).distance(pos) <= HANDLE_PX {
-                                self.op = Op::LineEnd { which_b: i == 1 };
+                if let Some(Pending { kind: PendingKind::Shape(s), .. }) = &mut self.pending {
+                    if s.kind.by_points() {
+                        let verts = s.vertices();
+                        let near = |q: Pos2| self.view.to_screen(q).distance(pos) <= HANDLE_PX;
+                        // Clicking the first corner closes a polygon.
+                        if s.kind == ShapeKind::Polygon && s.stage == 1 && verts.len() > 2 && near(verts[0]) {
+                            s.stage = 2;
+                            self.rerender_pending();
+                            return false;
+                        }
+                        if let Some(idx) = verts.iter().position(|v| near(*v)) {
+                            self.op = Op::Vertex { idx };
+                            return true;
+                        }
+                        match (s.kind, s.stage) {
+                            (ShapeKind::Curve, 1 | 2) => {
+                                let q = snap(p);
+                                let first = s.stage == 1;
+                                if first {
+                                    s.pts = vec![q, q];
+                                } else {
+                                    s.pts[1] = q;
+                                }
+                                self.op = Op::CurveBend { first };
+                                self.rerender_pending();
                                 return true;
                             }
+                            (ShapeKind::Polygon, 1) => {
+                                s.pts.push(snap(p));
+                                self.op = Op::Vertex { idx: s.pts.len() - 1 };
+                                self.rerender_pending();
+                                return true;
+                            }
+                            _ => {}
                         }
                     } else {
                         let bb = s.bbox();
@@ -409,8 +457,9 @@ impl DaubApp {
                             }
                         }
                     }
-                    if self.shape_hit(s, p) {
-                        self.op = Op::ShapeMove { grab: p, a0: s.a, b0: s.b };
+                    let snapshot = s.clone();
+                    if self.shape_hit(&snapshot, p) {
+                        self.op = Op::ShapeMove { grab: p, orig: snapshot };
                         return true;
                     }
                 }
@@ -418,7 +467,7 @@ impl DaubApp {
                 let a = snap(p);
                 self.pending = Some(Pending {
                     base: self.doc.clone(),
-                    kind: PendingKind::Shape(ShapeState { kind: self.shape_kind, a, b: a, swap: right }),
+                    kind: PendingKind::Shape(ShapeState::new(self.shape_kind, a, right)),
                 });
                 self.op = Op::ShapeDraw { start: a };
             }
@@ -465,12 +514,9 @@ impl DaubApp {
                 *last = (x, y);
                 self.mark_changed();
             }
-            Op::Brush { points, before, color } => {
-                if points.last().is_none_or(|l| l.distance(p) >= 0.5) {
-                    points.push(p);
-                    render_brush(&mut self.doc, before, points, *color, self.sizes.brush);
-                    self.mark_changed();
-                }
+            Op::Brush { stroke } => {
+                stroke.add_point(&mut self.doc, p);
+                self.mark_changed();
             }
             Op::ShapeDraw { start } => {
                 if let Some(Pending { kind: PendingKind::Shape(s), .. }) = &mut self.pending {
@@ -490,22 +536,40 @@ impl DaubApp {
                 }
                 self.rerender_pending();
             }
-            Op::LineEnd { which_b } => {
+            Op::Vertex { idx } => {
                 if let Some(Pending { kind: PendingKind::Shape(s), .. }) = &mut self.pending {
-                    let other = if *which_b { s.a } else { s.b };
                     let mut q = snap(p);
-                    if mods.shift {
-                        q = shapes::constrain(s.kind, other, q);
+                    let verts = s.vertices();
+                    // Shift snaps a line end (or polygon corner) to 45° from its neighbor.
+                    if mods.shift && *idx < verts.len() {
+                        let other = match s.kind {
+                            ShapeKind::Polygon => verts[if *idx == 0 { verts.len() - 1 } else { *idx - 1 }],
+                            _ if *idx == 0 => verts[1],
+                            _ if *idx == 1 => verts[0],
+                            _ => q,
+                        };
+                        q = shapes::constrain(ShapeKind::Line, other, q);
                     }
-                    if *which_b { s.b = q } else { s.a = q }
+                    s.set_vertex(*idx, q);
                 }
                 self.rerender_pending();
             }
-            Op::ShapeMove { grab, a0, b0 } => {
+            Op::CurveBend { first } => {
+                if let Some(Pending { kind: PendingKind::Shape(s), .. }) = &mut self.pending {
+                    let q = snap(p);
+                    if *first {
+                        s.pts = vec![q, q];
+                    } else {
+                        s.pts[1] = q;
+                    }
+                }
+                self.rerender_pending();
+            }
+            Op::ShapeMove { grab, orig } => {
                 let d = (p - *grab).round();
                 if let Some(Pending { kind: PendingKind::Shape(s), .. }) = &mut self.pending {
-                    s.a = *a0 + d;
-                    s.b = *b0 + d;
+                    *s = orig.clone();
+                    s.translate(d);
                 }
                 self.rerender_pending();
             }
@@ -562,15 +626,29 @@ impl DaubApp {
     fn pointer_up(&mut self) {
         let op = std::mem::replace(&mut self.op, Op::Idle);
         match op {
-            Op::Pencil { before, .. } | Op::Eraser { before, .. } | Op::Brush { before, .. } => {
-                self.history.record(&before, &self.doc);
+            Op::Pencil { before, .. } | Op::Eraser { before, .. } => {
+                self.history.record(self.active, &before, &self.doc);
+            }
+            Op::Brush { stroke } => {
+                self.history.record(self.active, &stroke.before, &self.doc);
             }
             Op::ShapeDraw { .. } => {
-                // A click without a drag draws nothing.
-                if let Some(Pending { kind: PendingKind::Shape(s), .. }) = &self.pending
-                    && s.a.distance(s.b) < 1.0 {
+                if let Some(Pending { kind: PendingKind::Shape(s), .. }) = &mut self.pending {
+                    if s.a.distance(s.b) < 1.0 {
+                        // A click without a drag draws nothing.
                         self.cancel_pending();
+                    } else if s.kind == ShapeKind::Polygon {
+                        s.pts = vec![s.a, s.b];
+                        s.stage = 1;
+                    } else if s.kind == ShapeKind::Curve {
+                        s.stage = 1;
                     }
+                }
+            }
+            Op::CurveBend { .. } => {
+                if let Some(Pending { kind: PendingKind::Shape(s), .. }) = &mut self.pending {
+                    s.stage += 1;
+                }
             }
             Op::SelectRect { start, end } => {
                 let w = self.doc.width() as f32;
@@ -624,7 +702,7 @@ impl DaubApp {
         let object_handle = match &self.pending {
             Some(Pending { kind: PendingKind::Selection(s), .. }) => handle_points(s.current_rect()).into_iter().any(near),
             Some(Pending { kind: PendingKind::Shape(s), .. }) => {
-                [s.a, s.b].into_iter().chain(handle_points(s.bbox())).any(near)
+                s.vertices().into_iter().chain(handle_points(s.bbox())).any(near)
             }
             _ => false,
         };
@@ -708,12 +786,18 @@ impl DaubApp {
     }
 
     fn shape_hit(&self, s: &ShapeState, p: Pos2) -> bool {
-        if s.kind.is_line() {
-            let (a, b) = (s.a, s.b);
-            let ab = b - a;
-            let t = ((p - a).dot(ab) / ab.length_sq().max(1e-6)).clamp(0.0, 1.0);
-            let d = (a + ab * t).distance(p);
-            d * self.view.zoom <= (self.sizes.shape * self.view.zoom / 2.0).max(5.0)
+        if s.kind.is_open() {
+            // Near the drawn path.
+            let reach = (self.sizes.shape / 2.0).max(5.0 / self.view.zoom);
+            let lines = s.path().map(|path| shapes::flatten(&path)).unwrap_or_default();
+            lines.iter().any(|l| {
+                l.windows(2).any(|w| {
+                    let (a, b) = (w[0], w[1]);
+                    let ab = b - a;
+                    let t = ((p - a).dot(ab) / ab.length_sq().max(1e-6)).clamp(0.0, 1.0);
+                    (a + ab * t).distance(p) <= reach
+                })
+            })
         } else {
             s.bbox().contains(p)
         }
@@ -736,7 +820,7 @@ impl DaubApp {
         let handle = |painter: &egui::Painter, c: Pos2| {
             let r = Rect::from_center_size(c, vec2(7.0, 7.0));
             painter.rect_filled(r, 1.0, Color32::WHITE);
-            painter.rect_stroke(r, 1.0, Stroke::new(1.0, theme::ACCENT), StrokeKind::Inside);
+            painter.rect_stroke(r, 1.0, Stroke::new(1.0, theme::accent()), StrokeKind::Inside);
         };
 
         match &self.op {
@@ -785,9 +869,17 @@ impl DaubApp {
                 }
             }
             Some(Pending { kind: PendingKind::Shape(s), .. }) => {
-                if s.kind.is_line() {
-                    handle(painter, v.to_screen(s.a));
-                    handle(painter, v.to_screen(s.b));
+                if s.kind.by_points() {
+                    let verts = s.vertices();
+                    // Guide lines from each curve end to its control point.
+                    if s.kind == ShapeKind::Curve && verts.len() == 4 {
+                        let guide = Stroke::new(1.0, theme::accent().gamma_multiply(0.6));
+                        painter.line_segment([v.to_screen(verts[0]), v.to_screen(verts[2])], guide);
+                        painter.line_segment([v.to_screen(verts[1]), v.to_screen(verts[3])], guide);
+                    }
+                    for p in verts {
+                        handle(painter, v.to_screen(p));
+                    }
                 } else {
                     let r = v.rect_to_screen(s.bbox());
                     ants(painter, &rect_pts(r));
@@ -881,8 +973,12 @@ impl DaubApp {
 
     fn shape_cursor(&self, h: Pos2, p: Pos2) -> CursorIcon {
         if let Some(Pending { kind: PendingKind::Shape(s), .. }) = &self.pending {
-            if s.kind.is_line() {
-                if [s.a, s.b].iter().any(|e| self.view.to_screen(*e).distance(h) <= HANDLE_PX) {
+            if s.kind.by_points() {
+                if s.vertices().iter().any(|e| self.view.to_screen(*e).distance(h) <= HANDLE_PX) {
+                    return CursorIcon::Grab;
+                }
+                // Mid-edit curves and polygons take more clicks.
+                if matches!((s.kind, s.stage), (ShapeKind::Curve, 1 | 2) | (ShapeKind::Polygon, 1)) {
                     return CursorIcon::Crosshair;
                 }
             } else {
@@ -906,7 +1002,7 @@ impl DaubApp {
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             let small = |ui: &mut Ui, s: String| {
-                ui.label(egui::RichText::new(s).size(12.0).color(theme::SUBTLE_TEXT));
+                ui.label(egui::RichText::new(s).size(12.0).color(theme::subtle_text()));
             };
             small(ui, ic::CURSOR.to_string());
             small(ui, self.cursor_px.map(|(x, y)| format!("{x}, {y}px")).unwrap_or_default());
@@ -959,28 +1055,11 @@ impl DaubApp {
     }
 }
 
-fn render_brush(doc: &mut Pixmap, before: &Pixmap, points: &[Pos2], color: Color32, width: f32) {
-    raster::restore(doc, before);
-    let paint = raster::paint(color, true);
-    if points.len() == 1 {
-        let p = points[0];
-        if let Some(path) = tiny_skia::PathBuilder::from_circle(p.x, p.y, (width / 2.0).max(0.5)) {
-            doc.fill_path(&path, &paint, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
-        }
-        return;
-    }
-    let mut pb = tiny_skia::PathBuilder::new();
-    pb.move_to(points[0].x, points[0].y);
-    for p in &points[1..] {
-        pb.line_to(p.x, p.y);
-    }
-    if let Some(path) = pb.finish() {
-        let stroke = tiny_skia::Stroke {
-            width,
-            line_cap: tiny_skia::LineCap::Round,
-            line_join: tiny_skia::LineJoin::Round,
-            ..Default::default()
-        };
-        doc.stroke_path(&path, &paint, &stroke, tiny_skia::Transform::identity(), None);
+pub fn canvas_texture_options() -> egui::TextureOptions {
+    egui::TextureOptions {
+        magnification: egui::TextureFilter::Nearest,
+        minification: egui::TextureFilter::Linear,
+        wrap_mode: egui::TextureWrapMode::ClampToEdge,
+        mipmap_mode: None,
     }
 }
